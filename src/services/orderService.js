@@ -32,6 +32,30 @@ import db from '../config/db.js';
       // Reduce stock
       await db.query('UPDATE product SET stock_quantity = stock_quantity - ? WHERE id = ?', [item.quantity, p.id]);
 
+      // If the customer was holding in an active campaign for this product,
+      // remove their hold now that they've ordered — freeing the slot for others.
+      const [activeCampaigns] = await db.query(
+        "SELECT id FROM campaign WHERE product_id = ? AND status = 'ACTIVE' LIMIT 1",
+        [p.id]
+      );
+      if (activeCampaigns.length) {
+        const campaignId = activeCampaigns[0].id;
+        const [holdRow] = await db.query(
+          'SELECT id FROM campaign_hold WHERE campaign_id = ? AND customer_id = ?',
+          [campaignId, customerId]
+        );
+        if (holdRow.length) {
+          await db.query(
+            'DELETE FROM campaign_hold WHERE campaign_id = ? AND customer_id = ?',
+            [campaignId, customerId]
+          );
+          await db.query(
+            'UPDATE campaign SET current_hold = GREATEST(0, current_hold - 1) WHERE id = ?',
+            [campaignId]
+          );
+        }
+      }
+
       // Notify customer
       await db.query(
         'INSERT INTO customer_notification (customer_id, title, message, type) VALUES (?,?,?,?)',
