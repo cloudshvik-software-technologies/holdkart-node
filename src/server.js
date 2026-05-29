@@ -8,7 +8,7 @@ import 'dotenv/config';
     // ── Test DB connection before starting ──────────────────────────────────
     try {
       const [rows] = await db.query('SELECT 1');
-      console.log('✅  MySQL connected successfully (holdkart database)');
+      console.log('MySQL connected ');
     } catch (err) {
       console.error('\n❌  MySQL connection failed!');
       console.error('   Error:', err.message);
@@ -22,8 +22,8 @@ import 'dotenv/config';
     }
 
     app.listen(PORT, () => {
-      console.log(`🚀  HoldKart Customer API running → http://localhost:${PORT}`);
-      console.log(`    API prefix: /api/customer`);
+      console.log(`Server Connected on PORT ${PORT}`);
+      // console.log(`    API prefix: /api/customer`);
     });
   })();
   
