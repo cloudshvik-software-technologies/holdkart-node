@@ -17,9 +17,10 @@ export const addToCart = async ({ customerId, productId, quantity = 1 }) => {
 
 export const getCart = async (customerId) => {
   /*
-   * For each cart item we also check whether this customer has joined an ACTIVE
-   * group-deal campaign for that product.  If they have, we use the current
-   * hold count to compute the group-deal price (N joined = N% off).
+   * Use a subquery to find at most ONE active campaign per product for this
+   * customer. The old JOIN on product_id alone caused one cart row to multiply
+   * into N rows when the customer had campaign_hold entries in multiple past
+   * rounds for the same product.
    */
   const [rows] = await db.query(
     `SELECT
@@ -34,28 +35,42 @@ export const getCart = async (customerId) => {
        p.stock_quantity AS stock,
        p.category,
        p.hold_target   AS holdTarget,
-       -- active campaign the customer joined for this product (if any)
-       camp.id              AS campaignId,
-       camp.current_hold    AS campaignCurrentHold,
-       camp.target          AS campaignTarget,
-       camp.status          AS campaignStatus
+       -- Subquery: find the single active campaign this customer is currently in
+       -- for this product (if any). Returns NULL columns when not in one.
+       (SELECT camp.id
+          FROM campaign_hold ch2
+          JOIN campaign camp ON camp.id = ch2.campaign_id
+         WHERE ch2.customer_id = c.customer_id
+           AND ch2.product_id  = c.product_id
+           AND camp.status = 'ACTIVE'
+           AND (camp.end_time IS NULL OR camp.end_time > NOW())
+         LIMIT 1)                    AS campaignId,
+       (SELECT camp.current_hold
+          FROM campaign_hold ch2
+          JOIN campaign camp ON camp.id = ch2.campaign_id
+         WHERE ch2.customer_id = c.customer_id
+           AND ch2.product_id  = c.product_id
+           AND camp.status = 'ACTIVE'
+           AND (camp.end_time IS NULL OR camp.end_time > NOW())
+         LIMIT 1)                    AS campaignCurrentHold,
+       (SELECT camp.target
+          FROM campaign_hold ch2
+          JOIN campaign camp ON camp.id = ch2.campaign_id
+         WHERE ch2.customer_id = c.customer_id
+           AND ch2.product_id  = c.product_id
+           AND camp.status = 'ACTIVE'
+           AND (camp.end_time IS NULL OR camp.end_time > NOW())
+         LIMIT 1)                    AS campaignTarget
      FROM cart c
      JOIN product p ON p.id = c.product_id
-     LEFT JOIN campaign_hold ch
-           ON ch.customer_id = ? AND ch.product_id = c.product_id
-     LEFT JOIN campaign camp
-           ON camp.id = ch.campaign_id
-          AND camp.status = 'ACTIVE'
-          AND (camp.end_time IS NULL OR camp.end_time > NOW())
      WHERE c.customer_id = ?`,
-    [customerId, customerId]
+    [customerId]
   );
 
   return rows.map(r => {
-    /* discount = how many people currently in that campaign (N joined = N% off) */
-    const hasGroupDeal  = r.campaignId && r.campaignStatus === 'ACTIVE';
-    const safeHold      = hasGroupDeal ? Math.min(Number(r.campaignCurrentHold) || 0, Number(r.campaignTarget) || 0) : 0;
-    const discountPct   = safeHold;                                   // N joined = N% off
+    const hasGroupDeal   = Boolean(r.campaignId);
+    const safeHold       = hasGroupDeal ? Math.min(Number(r.campaignCurrentHold) || 0, Number(r.campaignTarget) || 0) : 0;
+    const discountPct    = safeHold;                        // N joined = N% off
     const effectivePrice = discountPct > 0
       ? Math.round(r.retailPrice * (1 - discountPct / 100))
       : r.retailPrice;
@@ -67,9 +82,9 @@ export const getCart = async (customerId) => {
       name:          r.name,
       retailPrice:   r.retailPrice,
       holdPrice:     r.holdPrice,
-      effectivePrice,                    // price the customer actually pays
-      discountPct,                       // 0 if no group deal
-      hasGroupDeal:  Boolean(hasGroupDeal),
+      effectivePrice,
+      discountPct,
+      hasGroupDeal,
       campaignId:    r.campaignId || null,
       imageUrl:      parseImages(r.image_url)[0] || null,
       stock:         r.stock,

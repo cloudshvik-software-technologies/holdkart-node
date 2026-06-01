@@ -7,4 +7,5 @@ r.post('/join',          authenticate, c.joinCampaign);
 r.post('/leave',         authenticate, c.leaveCampaign);
 r.get('/mine',           authenticate, c.getMyCampaigns);
 r.post('/start-or-join', authenticate, c.startOrJoinCampaign);
+r.get('/:id',           c.getCampaignById);
 export default r;

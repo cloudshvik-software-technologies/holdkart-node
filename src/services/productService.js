@@ -62,7 +62,8 @@ export const getCategories = async () => {
   return rows.map(r => r.category).filter(Boolean);
 };
 
-export const getFeaturedProducts = async () => {
+export const getFeaturedProducts = async ({ page = 1, limit = 10 } = {}) => {
+  const offset = (Number(page) - 1) * Number(limit);
   const [rows] = await db.query(
     `SELECT p.*, COALESCE(AVG(r.rating),0) AS avg_rating, COUNT(DISTINCT r.id) AS review_count,
      COALESCE((
@@ -72,7 +73,8 @@ export const getFeaturedProducts = async () => {
      ), 0) AS current_hold
      FROM product p LEFT JOIN review r ON r.product_id = p.id
      WHERE p.active = 1 AND p.stock_quantity > 0
-     GROUP BY p.id ORDER BY avg_rating DESC, p.id DESC LIMIT 8`
+     GROUP BY p.id ORDER BY avg_rating DESC, p.id DESC LIMIT ? OFFSET ?`,
+    [Number(limit), offset]
   );
   return rows.map(toProduct);
 };
