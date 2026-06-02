@@ -2,7 +2,7 @@ import db from '../config/db.js';
 
   const genOrderNumber = () => 'HK' + Date.now();
 
-  export const placeOrder = async ({ customerId, items, address, city, pincode, state, paymentMethod = 'COD', paymentId = null }) => {
+export const placeOrder = async ({ customerId, items, address, city, pincode, state, paymentMethod = 'COD', paymentId = null }) => {
     if (!items || !items.length) throw new Error('No items in order');
 
     const results = [];
@@ -15,7 +15,18 @@ import db from '../config/db.js';
       const [crows] = await db.query('SELECT * FROM customer WHERE id = ?', [customerId]);
       const customer = crows[0];
       const orderNumber = genOrderNumber();
-      const amount = p.retail_price * item.quantity;
+
+      // Check if this cart item is a DEAL row and read the actual deposit already paid
+      const [cartRow] = await db.query(
+        "SELECT price_type, locked_price, deposit_paid FROM cart WHERE customer_id = ? AND product_id = ? AND price_type = 'DEAL' LIMIT 1",
+        [customerId, item.productId]
+      );
+      const isDealItem  = cartRow.length > 0;
+      const lockedPrice = isDealItem ? Number(cartRow[0].locked_price) : Number(p.retail_price);
+      // Use the stored deposit (actual amount paid at join time), never re-derived from current qty
+      const depositPaid = isDealItem ? (Number(cartRow[0].deposit_paid) || 0) : 0;
+      // Amount still owed at checkout = deal-price total minus what was pre-paid
+      const amount      = Math.max(0, lockedPrice * item.quantity - depositPaid);
 
       const [r] = await db.query(
         `INSERT INTO orders (order_number, product_id, seller_id, customer_id, quantity, order_amount,
@@ -103,4 +114,3 @@ import db from '../config/db.js';
     await db.query('UPDATE product SET stock_quantity = stock_quantity + ? WHERE id = ?', [order.quantity, order.product_id]);
     return { message: 'Order cancelled successfully' };
   };
-  

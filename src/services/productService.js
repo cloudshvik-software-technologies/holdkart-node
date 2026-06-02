@@ -24,7 +24,7 @@ export const listProducts = async ({ search, category, minPrice, maxPrice, page 
   let sql = `SELECT p.*,
     COALESCE(AVG(r.rating),0) AS avg_rating, COUNT(DISTINCT r.id) AS review_count,
     COALESCE((
-      SELECT COUNT(DISTINCT ch.customer_id) FROM campaign_hold ch
+      SELECT COUNT(ch.id) FROM campaign_hold ch
       JOIN campaign c ON c.product_id = p.id AND c.id = ch.campaign_id
       WHERE c.status = 'ACTIVE'
     ), 0) AS current_hold
@@ -46,12 +46,12 @@ export const getProduct = async (productId) => {
   const [rows] = await db.query(
     `SELECT p.*, COALESCE(AVG(r.rating),0) AS avg_rating, COUNT(DISTINCT r.id) AS review_count,
      COALESCE((
-       SELECT COUNT(DISTINCT ch.customer_id) FROM campaign_hold ch
+       SELECT COUNT(ch.id) FROM campaign_hold ch
        JOIN campaign c ON c.product_id = p.id AND c.id = ch.campaign_id
        WHERE c.status = 'ACTIVE'
      ), 0) AS current_hold
      FROM product p LEFT JOIN review r ON r.product_id = p.id
-     WHERE p.id = ? GROUP BY p.id`,
+     WHERE p.id = ? AND p.active = 1 GROUP BY p.id`,
     [productId]
   );
   return rows[0] ? toProduct(rows[0]) : null;
@@ -67,7 +67,7 @@ export const getFeaturedProducts = async ({ page = 1, limit = 10 } = {}) => {
   const [rows] = await db.query(
     `SELECT p.*, COALESCE(AVG(r.rating),0) AS avg_rating, COUNT(DISTINCT r.id) AS review_count,
      COALESCE((
-       SELECT COUNT(DISTINCT ch.customer_id) FROM campaign_hold ch
+       SELECT COUNT(ch.id) FROM campaign_hold ch
        JOIN campaign c ON c.product_id = p.id AND c.id = ch.campaign_id
        WHERE c.status = 'ACTIVE'
      ), 0) AS current_hold
