@@ -20,7 +20,7 @@ import db from '../config/db.js';
               p.product_name AS name, p.retail_price AS retailPrice,
               p.hold_price AS holdPrice, p.image_url, p.stock_quantity AS stock,
               p.category, p.active
-       FROM wishlist w JOIN product p ON p.id = w.product_id
+       FROM wishlist w JOIN product p ON p.id = w.product_id AND p.active = 1
        WHERE w.customer_id = ? ORDER BY w.added_date DESC`,
       [customerId]
     );
@@ -36,4 +36,3 @@ import db from '../config/db.js';
     await db.query('DELETE FROM wishlist WHERE customer_id = ? AND product_id = ?', [customerId, productId]);
     return { message: 'Removed from wishlist' };
   };
-  
