@@ -12,5 +12,6 @@ r.use(authenticate);
 r.get('/get',           c.getProfile);
 r.put('/update',        c.updateProfile);
 r.post('/upload-image', uploadProfileImg, c.uploadProfileImage);
+r.delete('/delete-image', c.deleteProfileImage);
 
 export default r;

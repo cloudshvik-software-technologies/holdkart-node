@@ -53,7 +53,7 @@ export const joinCampaign = async ({ customerId, campaignId, quantity = 1 }) => 
 };
 
 export const leaveCampaign = async ({ customerId, campaignId }) => {
-  const [rows] = await db.query('SELECT * FROM campaign WHERE id = ? AND status = ?', [campaignId, 'ACTIVE']);
+  const [rows] = await db.query("SELECT * FROM campaign WHERE id = ? AND status IN ('ACTIVE', 'PAUSED')", [campaignId]);
   if (!rows.length) { const e = new Error('Cannot leave a completed or inactive campaign'); e.status = 400; throw e; }
 
   const [existing] = await db.query(
@@ -83,8 +83,9 @@ export const leaveCampaign = async ({ customerId, campaignId }) => {
 };
 
 /**
- * getMyCampaigns — returns only ACTIVE campaigns the customer has joined
+ * getMyCampaigns — returns ACTIVE and PAUSED campaigns the customer has joined
  * where the product is still active (not deleted by seller).
+ * PAUSED campaigns are included so customers who already joined can still view their product.
  */
 export const getMyCampaigns = async (customerId) => {
   await _cancelCampaignsForDeletedProducts(customerId);
@@ -98,7 +99,7 @@ export const getMyCampaigns = async (customerId) => {
      FROM campaign_hold ch
      JOIN campaign c ON c.id = ch.campaign_id
      JOIN product p ON p.id = ch.product_id AND p.active = 1
-     WHERE ch.customer_id = ? AND c.status = 'ACTIVE'
+     WHERE ch.customer_id = ? AND c.status IN ('ACTIVE', 'PAUSED')
      GROUP BY ch.campaign_id, c.id, ch.customer_id, ch.product_id,
               c.status, c.target, c.current_hold,
               p.product_name, p.image_url, p.retail_price, p.hold_price, p.category
@@ -106,6 +107,22 @@ export const getMyCampaigns = async (customerId) => {
     [customerId]
   );
   return rows;
+};
+
+/**
+ * getProductCampaignStatus — returns the campaign status for a given product.
+ * Used by the frontend to decide if a product is paused (existing holders can view
+ * but cannot buy; it shows as out of stock to them).
+ */
+export const getProductCampaignStatus = async (productId) => {
+  const [rows] = await db.query(
+    `SELECT status FROM campaign
+     WHERE product_id = ? AND status IN ('ACTIVE', 'PAUSED')
+     ORDER BY FIELD(status, 'ACTIVE', 'PAUSED') ASC
+     LIMIT 1`,
+    [productId]
+  );
+  return rows[0]?.status || null;
 };
 
 export const getCampaignById = async (campaignId) => {

@@ -29,7 +29,10 @@ export const listProducts = async ({ search, category, minPrice, maxPrice, page 
       WHERE c.status = 'ACTIVE'
     ), 0) AS current_hold
     FROM product p LEFT JOIN review r ON r.product_id = p.id
-    WHERE p.active = 1 AND p.stock_quantity > 0`;
+    WHERE p.active = 1 AND p.stock_quantity > 0
+    AND NOT EXISTS (
+      SELECT 1 FROM campaign c2 WHERE c2.product_id = p.id AND c2.status = 'PAUSED'
+    )`;
   const params = [];
   if (search)   { sql += ' AND p.product_name LIKE ?';   params.push(`%${search}%`); }
   if (category) { sql += ' AND p.category = ?';           params.push(category); }
@@ -57,9 +60,16 @@ export const getProduct = async (productId) => {
   return rows[0] ? toProduct(rows[0]) : null;
 };
 
+// Fixed seller-defined categories — must match exactly what the seller panel uses
+const SELLER_CATEGORIES = [
+  'Automotive', 'Beauty', 'Books', 'Electronics', 'Fashion',
+  'Grocery', 'Health', 'Home & Kitchen', 'Other', 'Sports',
+  'Sports & Fitness', 'Toys', 'Toys & Games',
+];
+
 export const getCategories = async () => {
-  const [rows] = await db.query('SELECT DISTINCT category FROM product WHERE active = 1 ORDER BY category');
-  return rows.map(r => r.category).filter(Boolean);
+  // Always return the full seller-defined category list
+  return SELLER_CATEGORIES;
 };
 
 export const getFeaturedProducts = async ({ page = 1, limit = 10 } = {}) => {
@@ -73,6 +83,9 @@ export const getFeaturedProducts = async ({ page = 1, limit = 10 } = {}) => {
      ), 0) AS current_hold
      FROM product p LEFT JOIN review r ON r.product_id = p.id
      WHERE p.active = 1 AND p.stock_quantity > 0
+     AND NOT EXISTS (
+       SELECT 1 FROM campaign c2 WHERE c2.product_id = p.id AND c2.status = 'PAUSED'
+     )
      GROUP BY p.id ORDER BY avg_rating DESC, p.id DESC LIMIT ? OFFSET ?`,
     [Number(limit), offset]
   );
