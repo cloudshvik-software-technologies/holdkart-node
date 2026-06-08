@@ -1,20 +1,89 @@
-import Razorpay from 'razorpay';
-  import crypto from 'crypto';
+import crypto from 'crypto';
 
-  const getRazorpay = () => new Razorpay({
-    key_id:     process.env.RAZORPAY_KEY_ID     || '',
-    key_secret: process.env.RAZORPAY_KEY_SECRET || '',
+const CASHFREE_APP_ID     = process.env.CASHFREE_APP_ID     || '';
+const CASHFREE_SECRET_KEY = process.env.CASHFREE_SECRET_KEY || '';
+// Cashfree test environment base URL
+const CF_BASE_URL = 'https://sandbox.cashfree.com/pg';
+
+/**
+ * Create a Cashfree payment order (test/sandbox).
+ * Returns the order_id and payment_session_id needed by the JS SDK.
+ */
+export const createOrder = async ({ amount, currency = 'INR', receipt, customerInfo = {} }) => {
+  const orderId = receipt || 'hk_' + Date.now();
+
+  const body = {
+    order_id:       orderId,
+    order_amount:   Number(amount).toFixed(2),
+    order_currency: currency,
+    customer_details: {
+      customer_id:    customerInfo.customerId || 'cust_' + Date.now(),
+      customer_email: customerInfo.email      || 'customer@holdkart.com',
+      customer_phone: customerInfo.phone      || '9999999999',
+      customer_name:  customerInfo.name       || 'HoldKart Customer',
+    },
+    order_meta: {
+      return_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/orders?order_id={order_id}`,
+      notify_url: `${process.env.BACKEND_URL  || 'http://localhost:8081'}/api/customer/payment/webhook`,
+    },
+  };
+
+  const response = await fetch(`${CF_BASE_URL}/orders`, {
+    method:  'POST',
+    headers: {
+      'Content-Type':   'application/json',
+      'x-api-version':  '2023-08-01',
+      'x-client-id':    CASHFREE_APP_ID,
+      'x-client-secret': CASHFREE_SECRET_KEY,
+    },
+    body: JSON.stringify(body),
   });
 
-  export const createOrder = async ({ amount, currency = 'INR', receipt }) => {
-    const rz = getRazorpay();
-    const order = await rz.orders.create({ amount: Math.round(amount * 100), currency, receipt: receipt || 'hk_' + Date.now() });
-    return { orderId: order.id, amount: order.amount, currency: order.currency, keyId: process.env.RAZORPAY_KEY_ID };
-  };
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.message || 'Cashfree order creation failed');
+  }
 
-  export const verifyPayment = ({ razorpay_order_id, razorpay_payment_id, razorpay_signature }) => {
-    const body = razorpay_order_id + '|' + razorpay_payment_id;
-    const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '').update(body).digest('hex');
-    return expected === razorpay_signature;
+  return {
+    orderId:          data.order_id,
+    paymentSessionId: data.payment_session_id,
+    amount:           data.order_amount,
+    currency:         data.order_currency,
+    appId:            CASHFREE_APP_ID,
   };
-  
+};
+
+/**
+ * Verify Cashfree payment by fetching order status from API.
+ * Returns true only when payment_status === 'PAID'.
+ */
+export const verifyPayment = async ({ orderId }) => {
+  const response = await fetch(`${CF_BASE_URL}/orders/${orderId}`, {
+    method:  'GET',
+    headers: {
+      'x-api-version':   '2023-08-01',
+      'x-client-id':     CASHFREE_APP_ID,
+      'x-client-secret': CASHFREE_SECRET_KEY,
+    },
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.message || 'Cashfree order fetch failed');
+  }
+
+  return data.order_status === 'PAID';
+};
+
+/**
+ * Verify Cashfree webhook signature.
+ * Cashfree signs: timestamp + rawBody  using HMAC-SHA256.
+ */
+export const verifyWebhookSignature = ({ rawBody, signature, timestamp }) => {
+  const signatureData = timestamp + rawBody;
+  const expected = crypto
+    .createHmac('sha256', CASHFREE_SECRET_KEY)
+    .update(signatureData)
+    .digest('base64');
+  return expected === signature;
+};
