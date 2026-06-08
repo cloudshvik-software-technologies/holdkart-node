@@ -56,3 +56,9 @@ export const uploadProfileImage = async ({ customerId, imageUrl }) => {
   await db.query('UPDATE customer SET profile_image = ? WHERE id = ?', [imageUrl, customerId]);
   return { message: 'Profile image updated', imageUrl };
 };
+export const deleteProfileImage = async ({ customerId }) => {
+  const cols = await getCols();
+  if (!cols.has('profile_image')) return { message: 'No profile image to delete' };
+  await db.query('UPDATE customer SET profile_image = NULL WHERE id = ?', [customerId]);
+  return { message: 'Profile image removed' };
+};

@@ -39,7 +39,14 @@ export const uploadProfileImage = async (req, res) => {
   }
 };
 
-/* ── GET /api/customer/profile/debug  (no auth — remove after fixing) ──────── */
+export const deleteProfileImage = async (req, res) => {
+  try {
+    res.json(await svc.deleteProfileImage({ customerId: req.customer.id }));
+  } catch (e) {
+    console.error('[profileController.deleteProfileImage] ERROR:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+};
 export const debugProfile = async (_req, res) => {
   const results = {};
   try {
