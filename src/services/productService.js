@@ -14,6 +14,7 @@ const toProduct = (p) => {
     imageUrl: images[0] || null, images,
     retailPrice: p.retail_price, holdPrice: p.hold_price, holdTarget: p.hold_target,
     currentHold: Number(p.current_hold) || 0,
+    hasCampaign: Number(p.has_campaign) === 1,
     stock: p.stock_quantity, active: Boolean(p.active),
     warehouseLocation: p.warehouse_location,
     avgRating: Number(p.avg_rating) || 0, reviewCount: Number(p.review_count) || 0,
@@ -27,7 +28,11 @@ export const listProducts = async ({ search, category, minPrice, maxPrice, page 
       SELECT COUNT(ch.id) FROM campaign_hold ch
       JOIN campaign c ON c.product_id = p.id AND c.id = ch.campaign_id
       WHERE c.status = 'ACTIVE'
-    ), 0) AS current_hold
+    ), 0) AS current_hold,
+    EXISTS (
+      SELECT 1 FROM campaign c3
+      WHERE c3.product_id = p.id AND c3.status = 'ACTIVE'
+    ) AS has_campaign
     FROM product p LEFT JOIN review r ON r.product_id = p.id
     WHERE p.active = 1 AND p.stock_quantity > 0
     AND NOT EXISTS (
@@ -52,7 +57,11 @@ export const getProduct = async (productId) => {
        SELECT COUNT(ch.id) FROM campaign_hold ch
        JOIN campaign c ON c.product_id = p.id AND c.id = ch.campaign_id
        WHERE c.status = 'ACTIVE'
-     ), 0) AS current_hold
+     ), 0) AS current_hold,
+     EXISTS (
+       SELECT 1 FROM campaign c3
+       WHERE c3.product_id = p.id AND c3.status = 'ACTIVE'
+     ) AS has_campaign
      FROM product p LEFT JOIN review r ON r.product_id = p.id
      WHERE p.id = ? AND p.active = 1 GROUP BY p.id`,
     [productId]
@@ -80,7 +89,11 @@ export const getFeaturedProducts = async ({ page = 1, limit = 10 } = {}) => {
        SELECT COUNT(ch.id) FROM campaign_hold ch
        JOIN campaign c ON c.product_id = p.id AND c.id = ch.campaign_id
        WHERE c.status = 'ACTIVE'
-     ), 0) AS current_hold
+     ), 0) AS current_hold,
+     EXISTS (
+       SELECT 1 FROM campaign c3
+       WHERE c3.product_id = p.id AND c3.status = 'ACTIVE'
+     ) AS has_campaign
      FROM product p LEFT JOIN review r ON r.product_id = p.id
      WHERE p.active = 1 AND p.stock_quantity > 0
      AND NOT EXISTS (

@@ -1,4 +1,5 @@
 import db from '../config/db.js';
+import * as txSvc from './transactionService.js';
 
 export const listCampaigns = async () => {
   const [rows] = await db.query(
@@ -140,7 +141,7 @@ export const getCampaignById = async (campaignId) => {
   return rows[0];
 };
 
-export const startOrJoinCampaign = async ({ customerId, productId, quantity = 1 }) => {
+export const startOrJoinCampaign = async ({ customerId, productId, quantity = 1, cashfreeOrderId = null, depositAmount = null }) => {
   quantity = Math.max(1, parseInt(quantity, 10) || 1);
 
   const [products] = await db.query(
@@ -201,13 +202,44 @@ export const startOrJoinCampaign = async ({ customerId, productId, quantity = 1 
     await _completeCampaignAndReset(updated[0]);
   }
 
+  // Record deposit transaction using actual payment info from frontend
+  try {
+    const [priceRows] = await db.query(
+      'SELECT retail_price, hold_price, product_name FROM product WHERE id = ?',
+      [productId]
+    );
+    if (priceRows.length) {
+      const retailPrice    = Number(priceRows[0].retail_price);
+      const holdPrice      = Number(priceRows[0].hold_price);
+      const productName    = priceRows[0].product_name;
+      const depositPerUnit = Math.max(0, retailPrice - holdPrice);
+      // Use actual amount paid from frontend; fall back to calculated deposit
+      const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+      if (totalDeposit > 0) {
+        await txSvc.record({
+          customerId,
+          orderId:         null,
+          orderNumber:     null,
+          amount:          totalDeposit,
+          type:            'DEAL_DEPOSIT',
+          method:          'Online',
+          status:          'SUCCESS',
+          description:     `Deal deposit for "${productName}" x${quantity} (Campaign #${campaign.id})`,
+          cashfreeOrderId: cashfreeOrderId,
+        });
+      }
+    }
+  } catch (txErr) {
+    console.error('[campaignService] transaction record error:', txErr.message);
+  }
+
   return { message: 'You have joined the group deal!', campaignId: campaign.id };
 };
 
 /**
  * addToDeal — called when an already-joined customer adds more units.
  */
-export const addToDeal = async ({ customerId, productId, quantity = 1 }) => {
+export const addToDeal = async ({ customerId, productId, quantity = 1, cashfreeOrderId = null, depositAmount = null }) => {
   quantity = Math.max(1, parseInt(quantity, 10) || 1);
 
   const [campaigns] = await db.query(
@@ -238,6 +270,36 @@ export const addToDeal = async ({ customerId, productId, quantity = 1 }) => {
   const dealCompleted = !!(updated[0] && updated[0].current_hold >= updated[0].target);
   if (dealCompleted) {
     await _completeCampaignAndReset(updated[0]);
+  }
+
+  // Record deposit transaction for the added slots
+  try {
+    const [priceRows] = await db.query(
+      'SELECT retail_price, hold_price, product_name FROM product WHERE id = ?',
+      [productId]
+    );
+    if (priceRows.length) {
+      const retailPrice    = Number(priceRows[0].retail_price);
+      const holdPrice      = Number(priceRows[0].hold_price);
+      const productName    = priceRows[0].product_name;
+      const depositPerUnit = Math.max(0, retailPrice - holdPrice);
+      const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+      if (totalDeposit > 0) {
+        await txSvc.record({
+          customerId,
+          orderId:         null,
+          orderNumber:     null,
+          amount:          totalDeposit,
+          type:            'DEAL_DEPOSIT',
+          method:          'Online',
+          status:          'SUCCESS',
+          description:     `Deal deposit for "${productName}" x${quantity} (Campaign #${campaign.id})`,
+          cashfreeOrderId: cashfreeOrderId,
+        });
+      }
+    }
+  } catch (txErr) {
+    console.error('[campaignService] addToDeal transaction error:', txErr.message);
   }
 
   return { message: 'Slot added to deal!', campaignId: campaign.id, dealCompleted };

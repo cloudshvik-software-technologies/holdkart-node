@@ -1,5 +1,6 @@
 import db from '../config/db.js';
 import * as svc from '../services/paymentService.js';
+import * as txSvc from '../services/transactionService.js';
 
 /**
  * POST /api/customer/payment/create-order
@@ -77,7 +78,40 @@ export const handleWebhook = async (req, res) => {
 
     const { type, data } = req.body;
     console.log('[Cashfree Webhook]', type, data?.order?.order_id);
-    // You can add DB updates here for PAYMENT_SUCCESS / PAYMENT_FAILED events
+    // Record transaction and update order payment_status on PAYMENT_SUCCESS
+    if (type === 'PAYMENT_SUCCESS') {
+      try {
+        const cfOrderId = data?.order?.order_id;
+        const cfAmount  = data?.payment?.payment_amount;
+        if (cfOrderId) {
+          // Update matching order to Paid
+          const [orderRows] = await db.query(
+            'SELECT * FROM orders WHERE payment_method = ? AND payment_status != ? LIMIT 1',
+            ['Online', 'Paid']
+          );
+          if (orderRows.length) {
+            const order = orderRows[0];
+            await db.query(
+              'UPDATE orders SET payment_status = ? WHERE id = ?',
+              ['Paid', order.id]
+            );
+            await txSvc.record({
+              customerId:      order.customer_id,
+              orderId:         order.id,
+              orderNumber:     order.order_number,
+              amount:          cfAmount || order.order_amount,
+              type:            'DEBIT',
+              method:          'Online',
+              status:          'SUCCESS',
+              description:     `Online payment for order ${order.order_number}`,
+              cashfreeOrderId: cfOrderId,
+            });
+          }
+        }
+      } catch (e) {
+        console.error('[Webhook] transaction record error:', e.message);
+      }
+    }
     res.json({ status: 'ok' });
   } catch (e) {
     console.error('[Payment] webhook error:', e.message);

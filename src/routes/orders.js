@@ -6,6 +6,6 @@ import { Router } from 'express';
   r.post('/place',   c.placeOrder);
   r.get('/list',     c.listOrders);
   r.put('/cancel',   c.cancelOrder);
+  r.put('/return',   c.returnOrder);
   r.get('/:orderId', c.getOrder);
   export default r;
-  

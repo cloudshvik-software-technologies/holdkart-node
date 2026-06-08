@@ -48,6 +48,15 @@ export const deleteReview = async (req, res) => {
   }
 };
 
+export const getReviewedProducts = async (req, res) => {
+  try {
+    const productIds = await svc.getReviewedProducts(req.customer.id);
+    res.json({ productIds });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+};
+
 export const getProductReviews = async (req, res) => {
   try {
     res.json(await svc.getProductReviews(req.params.productId));

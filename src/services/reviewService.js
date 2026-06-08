@@ -103,6 +103,14 @@ export const deleteReview = async ({ customerId, reviewId }) => {
   return { message: 'Review deleted' };
 };
 
+export const getReviewedProducts = async (customerId) => {
+  const [rows] = await db.query(
+    'SELECT DISTINCT product_id FROM review WHERE customer_id = ?',
+    [customerId]
+  );
+  return rows.map(r => String(r.product_id));
+};
+
 export const getProductReviews = async (productId) => {
   const [rows] = await db.query(
     `SELECT r.*, c.name AS customerName

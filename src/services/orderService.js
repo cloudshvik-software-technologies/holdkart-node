@@ -1,4 +1,5 @@
 import db from '../config/db.js';
+import * as txSvc from './transactionService.js';
 
 const genOrderNumber = () => 'HK' + Date.now();
 
@@ -90,6 +91,23 @@ export const placeOrder = async ({
     );
 
     results.push({ orderId: r.insertId, orderNumber, productName: p.product_name, amount });
+
+    // Record customer transaction for this order item
+    try {
+      await txSvc.record({
+        customerId,
+        orderId:     r.insertId,
+        orderNumber,
+        amount,
+        type:        paymentMethod === 'Online' ? 'DEBIT' : 'COD',
+        method:      paymentMethod,
+        status:      paymentMethod === 'Online' ? 'SUCCESS' : 'PENDING',
+        description: `Order ${orderNumber} — ${p.product_name} x${item.quantity}`,
+        cashfreeOrderId: paymentId || null,
+      });
+    } catch (txErr) {
+      console.error('[orderService] transaction record error:', txErr.message);
+    }
   }
 
   await db.query('DELETE FROM cart WHERE customer_id = ?', [customerId]);
@@ -103,6 +121,9 @@ export const listOrders = async (customerId) => {
         WHERE ocr.order_id = o.id
           AND ocr.resolution_type = 'Replace'
           AND ocr.status = 'Approved') AS has_replacement,
+       (SELECT COUNT(*) FROM review rv
+        WHERE rv.customer_id = o.customer_id
+          AND rv.product_id = o.product_id) AS has_reviewed,
        p.image_url AS product_image_raw
      FROM orders o
      LEFT JOIN seller s ON s.id = o.seller_id

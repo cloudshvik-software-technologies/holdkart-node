@@ -7,6 +7,7 @@ const r = Router();
 
 // Check if authenticated customer is eligible to review a product
 r.get('/can-review/:productId', authenticate, c.checkCanReview);
+r.get('/reviewed-products',    authenticate, c.getReviewedProducts);
 
 // Submit a review (with optional image attachments — multipart/form-data)
 r.post('/add', authenticate, uploadReviewImages, c.addReview);
