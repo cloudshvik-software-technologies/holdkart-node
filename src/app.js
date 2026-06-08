@@ -19,6 +19,7 @@ import reviewRoutes       from './routes/review.js';
 import campaignRoutes     from './routes/campaign.js';
 import paymentRoutes      from './routes/payment.js';
 import { notFound, errorHandler } from './middleware/errorHandler.js';
+import env from './config/env.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
@@ -26,7 +27,14 @@ const __dirname  = path.dirname(__filename);
 const app = express();
 
 // ── Core middleware ────────────────────────────────────────────────────────────
-app.use(cors({ origin: '*', maxAge: 3600 }));
+app.use(
+  cors({
+    origin:      env.frontendUrl,
+    credentials: true,
+    methods:     ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
