@@ -151,12 +151,7 @@ export const startOrJoinCampaign = async ({ customerId, productId, quantity = 1,
   if (!products.length) { const e = new Error('Product not found or no longer available'); e.status = 404; throw e; }
   const product = products[0];
 
-  if (!product.hold_target || product.hold_target <= 0) {
-    const e = new Error('This product does not support group deals');
-    e.status = 400;
-    throw e;
-  }
-
+  // Check for an existing active campaign first (seller may have set target via campaign portal)
   let [campaigns] = await db.query(
     "SELECT * FROM campaign WHERE product_id = ? AND status = 'ACTIVE' AND (end_time IS NULL OR end_time > NOW()) LIMIT 1",
     [productId]
@@ -164,11 +159,19 @@ export const startOrJoinCampaign = async ({ customerId, productId, quantity = 1,
 
   let campaign = campaigns[0];
 
+  // Product supports group deals if it has hold_target set OR already has an active campaign
+  const effectiveTarget = (campaign && campaign.target > 0) ? campaign.target : product.hold_target;
+  if (!effectiveTarget || effectiveTarget <= 0) {
+    const e = new Error('This product does not support group deals');
+    e.status = 400;
+    throw e;
+  }
+
   if (!campaign) {
     const [result] = await db.query(
       `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time)
        VALUES (?, ?, ?, 0, 'ACTIVE', NOW())`,
-      [productId, product.seller_id, product.hold_target]
+      [productId, product.seller_id, effectiveTarget]
     );
     const [newCampaign] = await db.query('SELECT * FROM campaign WHERE id = ?', [result.insertId]);
     campaign = newCampaign[0];
@@ -384,10 +387,10 @@ async function _completeCampaignAndReset(campaign) {
   );
 
   const [priceRows] = await db.query('SELECT retail_price, hold_price, product_name FROM product WHERE id = ?', [campaign.product_id]);
-  const lockedPrice   = priceRows[0]?.hold_price   ?? null;
-  const retailPrice   = priceRows[0]?.retail_price  ?? null;
   const productName   = priceRows[0]?.product_name || 'the product';
-
+  // Prefer campaign-level prices (set via seller portal) over product-level prices
+  const lockedPrice = (Number(campaign.hold_price) > 0 ? Number(campaign.hold_price) : null) ?? (Number(priceRows[0]?.hold_price) || null);
+  const retailPrice = (Number(campaign.retail_price) > 0 ? Number(campaign.retail_price) : null) ?? (Number(priceRows[0]?.retail_price) || null);
   // depositPerUnit = what each customer paid upfront when joining = retailPrice - holdPrice
   const depositPerUnit = (retailPrice !== null && lockedPrice !== null)
     ? Math.max(0, Number(retailPrice) - Number(lockedPrice))
@@ -441,10 +444,16 @@ async function _completeCampaignAndReset(campaign) {
     [campaign.product_id]
   );
   if (stockRows.length && stockRows[0].stock_quantity > 0) {
-    await db.query(
-      `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time)
-       VALUES (?, ?, ?, 0, 'ACTIVE', NOW())`,
-      [campaign.product_id, stockRows[0].seller_id, stockRows[0].hold_target]
-    );
+    // Use campaign's own target/prices (set via seller portal); fall back to product table
+    const newTarget      = (campaign.target > 0 ? campaign.target : stockRows[0].hold_target) || 0;
+    const newHoldPrice   = campaign.hold_price   || null;
+    const newRetailPrice = campaign.retail_price || null;
+    if (newTarget > 0) {
+      await db.query(
+        `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time, hold_price, retail_price)
+         VALUES (?, ?, ?, 0, 'ACTIVE', NOW(), ?, ?)`,
+        [campaign.product_id, stockRows[0].seller_id, newTarget, newHoldPrice, newRetailPrice]
+      );
+    }
   }
 }

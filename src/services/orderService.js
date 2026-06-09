@@ -1,5 +1,6 @@
 import db from '../config/db.js';
 import * as txSvc from './transactionService.js';
+import * as shiprocket from './shiprocketService.js';
 
 const genOrderNumber = () => 'HK' + Date.now();
 
@@ -92,6 +93,38 @@ export const placeOrder = async ({
 
     results.push({ orderId: r.insertId, orderNumber, productName: p.product_name, amount });
 
+    // Create Shiprocket order and store tracking info
+    try {
+      await db.query(`ALTER TABLE orders ADD COLUMN shiprocket_order_id VARCHAR(100) DEFAULT NULL`, []).catch(() => {});
+      await db.query(`ALTER TABLE orders ADD COLUMN shiprocket_shipment_id VARCHAR(100) DEFAULT NULL`, []).catch(() => {});
+      await db.query(`ALTER TABLE orders ADD COLUMN awb_code VARCHAR(100) DEFAULT NULL`, []).catch(() => {});
+
+      const orderDateStr = new Date().toISOString().replace('T', ' ').substring(0, 16);
+      const sr = await shiprocket.createShiprocketOrder({
+        orderId:       r.insertId,
+        orderNumber,
+        orderDate:     orderDateStr,
+        customerName:  customer?.name     || '',
+        customerEmail: customer?.email    || '',
+        customerPhone: customer?.mobile   || '',
+        address,
+        city,
+        pincode,
+        state,
+        productName:   p.product_name,
+        quantity:      item.quantity,
+        price:         lockedPrice,
+      });
+
+      await db.query(
+        'UPDATE orders SET shiprocket_order_id = ?, shiprocket_shipment_id = ?, awb_code = ? WHERE id = ?',
+        [sr.shiprocketOrderId, sr.shiprocketShipmentId, sr.awbCode, r.insertId]
+      );
+    } catch (srErr) {
+      console.error('[orderService] Shiprocket error:', srErr.message);
+      // Don't fail the order if Shiprocket is down — order is still placed
+    }
+
     // Record customer transaction for this order item
     try {
       await txSvc.record({
@@ -110,8 +143,45 @@ export const placeOrder = async ({
     }
   }
 
-  await db.query('DELETE FROM cart WHERE customer_id = ?', [customerId]);
+  // Remove only the ordered items from cart, not the entire cart
+  for (const item of items) {
+    await db.query('DELETE FROM cart WHERE customer_id = ? AND product_id = ?', [customerId, item.productId]);
+  }
   return { message: 'Order placed successfully', orders: results };
+};
+
+export const trackOrder = async (orderId, customerId) => {
+  const [rows] = await db.query(
+    'SELECT id, order_number, order_status, delivery_status, awb_code, shiprocket_order_id FROM orders WHERE id = ? AND customer_id = ?',
+    [orderId, customerId]
+  );
+  if (!rows.length) throw Object.assign(new Error('Order not found'), { status: 404 });
+  const order = rows[0];
+
+  // If we have an AWB code, get live tracking from Shiprocket
+  if (order.awb_code) {
+    try {
+      const tracking = await shiprocket.trackByAwb(order.awb_code);
+      return {
+        orderNumber:    order.order_number,
+        orderStatus:    order.order_status,
+        deliveryStatus: order.delivery_status,
+        awbCode:        order.awb_code,
+        tracking,
+      };
+    } catch (e) {
+      console.error('[trackOrder] Shiprocket tracking error:', e.message);
+    }
+  }
+
+  // Fallback: return DB status only
+  return {
+    orderNumber:    order.order_number,
+    orderStatus:    order.order_status,
+    deliveryStatus: order.delivery_status,
+    awbCode:        order.awb_code || null,
+    tracking:       null,
+  };
 };
 
 export const listOrders = async (customerId) => {

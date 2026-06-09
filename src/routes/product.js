@@ -4,6 +4,6 @@ import { Router } from 'express';
   r.get('/list',             c.listProducts);
   r.get('/categories',       c.getCategories);
   r.get('/featured',         c.getFeatured);
+  r.get('/:productId/delivery-estimate', c.getDeliveryEstimate);
   r.get('/:productId',       c.getProduct);
   export default r;
-  
