@@ -12,8 +12,11 @@ r.get('/reviewed-products',    authenticate, c.getReviewedProducts);
 // Submit a review (with optional image attachments — multipart/form-data)
 r.post('/add', authenticate, uploadReviewImages, c.addReview);
 
-// Public: fetch all reviews for a product
+// Public: fetch all reviews for a product (sends userVote if authenticated)
 r.get('/list/:productId', c.getProductReviews);
+
+// Toggle like on a review (authenticated customers only)
+r.post('/:reviewId/like', authenticate, c.toggleReviewLike);
 
 // Get current customer's review for a specific order
 r.get('/my-review/:orderId', authenticate, c.getMyReview);

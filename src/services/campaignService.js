@@ -3,7 +3,9 @@ import * as txSvc from './transactionService.js';
 
 export const listCampaigns = async () => {
   const [rows] = await db.query(
-    `SELECT c.*, p.product_name, p.image_url, p.retail_price, p.hold_price, p.description,
+    `SELECT c.*, p.product_name, p.image_url, p.description, p.category,
+            COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
+            COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price,
             s.business_name AS sellerName,
             ROUND((c.current_hold / c.target) * 100) AS progressPct
      FROM campaign c
@@ -84,30 +86,95 @@ export const leaveCampaign = async ({ customerId, campaignId }) => {
 };
 
 /**
- * getMyCampaigns — returns ACTIVE and PAUSED campaigns the customer has joined
- * where the product is still active (not deleted by seller).
+ * getMyCampaigns — returns ACTIVE, PAUSED, and CANCELLED campaigns the customer has joined.
  * PAUSED campaigns are included so customers who already joined can still view their product.
+ * CANCELLED campaigns include: seller-cancelled deals (via campaign_hold) AND
+ *   deals the customer manually removed from cart (via customer_cancelled_deal table).
  */
 export const getMyCampaigns = async (customerId) => {
   await _cancelCampaignsForDeletedProducts(customerId);
 
-  const [rows] = await db.query(
+  // Ensure the customer_cancelled_deal tracking table exists
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS customer_cancelled_deal (
+      id           INT AUTO_INCREMENT PRIMARY KEY,
+      customer_id  INT NOT NULL,
+      product_id   INT NOT NULL,
+      campaign_id  INT,
+      cancelled_at DATETIME NOT NULL DEFAULT NOW(),
+      INDEX idx_ccd_customer (customer_id)
+    )
+  `);
+
+  // Part 1: ACTIVE and PAUSED deals (customer still has campaign_hold rows)
+  const [activeRows] = await db.query(
     `SELECT MIN(ch.id) AS holdId, ch.campaign_id, c.id AS campaignRowId, ch.customer_id,
             ch.product_id, MIN(ch.joined_date) AS joined_date,
             c.status AS campaignStatus, c.target, c.current_hold,
             COUNT(ch.id) AS mySlots,
-            p.product_name, p.image_url, p.retail_price, p.hold_price, p.category
+            p.product_name, p.image_url, p.category,
+            COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
+            COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price
      FROM campaign_hold ch
      JOIN campaign c ON c.id = ch.campaign_id
-     JOIN product p ON p.id = ch.product_id AND p.active = 1
+     LEFT JOIN product p ON p.id = ch.product_id
      WHERE ch.customer_id = ? AND c.status IN ('ACTIVE', 'PAUSED')
      GROUP BY ch.campaign_id, c.id, ch.customer_id, ch.product_id,
               c.status, c.target, c.current_hold,
-              p.product_name, p.image_url, p.retail_price, p.hold_price, p.category
-     ORDER BY joined_date DESC`,
+              p.product_name, p.image_url, p.category,
+              c.retail_price, c.hold_price, p.retail_price, p.hold_price`,
     [customerId]
   );
-  return rows;
+
+  // Part 2: Seller-cancelled deals (campaign status = CANCELLED, hold rows may still exist)
+  const [sellerCancelledRows] = await db.query(
+    `SELECT MIN(ch.id) AS holdId, ch.campaign_id, c.id AS campaignRowId, ch.customer_id,
+            ch.product_id, MIN(ch.joined_date) AS joined_date,
+            'CANCELLED' AS campaignStatus, c.target, c.current_hold,
+            COUNT(ch.id) AS mySlots,
+            p.product_name, p.image_url, p.category,
+            COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
+            COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price
+     FROM campaign_hold ch
+     JOIN campaign c ON c.id = ch.campaign_id
+     LEFT JOIN product p ON p.id = ch.product_id
+     WHERE ch.customer_id = ? AND c.status = 'CANCELLED'
+     GROUP BY ch.campaign_id, c.id, ch.customer_id, ch.product_id,
+              c.target, c.current_hold,
+              p.product_name, p.image_url, p.category,
+              c.retail_price, c.hold_price, p.retail_price, p.hold_price`,
+    [customerId]
+  );
+
+  // Part 3: Customer-cancelled deals (removed DEAL item from cart after deal completed)
+  const [customerCancelledRows] = await db.query(
+    `SELECT ccd.id AS holdId, ccd.campaign_id, ccd.campaign_id AS campaignRowId, ccd.customer_id,
+            ccd.product_id, ccd.cancelled_at AS joined_date,
+            'CANCELLED' AS campaignStatus,
+            COALESCE(c.target, 0) AS target, COALESCE(c.current_hold, 0) AS current_hold,
+            1 AS mySlots,
+            p.product_name, p.image_url, p.category,
+            COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
+            COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price
+     FROM customer_cancelled_deal ccd
+     LEFT JOIN campaign c ON c.id = ccd.campaign_id
+     LEFT JOIN product p ON p.id = ccd.product_id
+     WHERE ccd.customer_id = ?`,
+    [customerId]
+  );
+
+  // Merge all, deduplicate by product_id (prefer active/paused over cancelled)
+  const seen = new Set();
+  const result = [];
+  for (const row of [...activeRows, ...sellerCancelledRows, ...customerCancelledRows]) {
+    const key = String(row.product_id);
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(row);
+    }
+  }
+
+  return result.sort((a, b) => new Date(b.joined_date) - new Date(a.joined_date));
 };
 
 /**
@@ -128,7 +195,9 @@ export const getProductCampaignStatus = async (productId) => {
 
 export const getCampaignById = async (campaignId) => {
   const [rows] = await db.query(
-    `SELECT c.*, p.product_name, p.image_url, p.retail_price, p.hold_price, p.description,
+    `SELECT c.*, p.product_name, p.image_url, p.description,
+            COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
+            COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price,
             s.business_name AS sellerName,
             ROUND((c.current_hold / c.target) * 100) AS progressPct
      FROM campaign c

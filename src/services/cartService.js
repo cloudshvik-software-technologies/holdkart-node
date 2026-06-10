@@ -131,6 +131,39 @@ export const updateCartItem = async ({ customerId, cartId, quantity }) => {
 };
 
 export const removeFromCart = async ({ customerId, cartId }) => {
+  // Ensure the customer_cancelled_deal tracking table exists
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS customer_cancelled_deal (
+      id           INT AUTO_INCREMENT PRIMARY KEY,
+      customer_id  INT NOT NULL,
+      product_id   INT NOT NULL,
+      campaign_id  INT,
+      cancelled_at DATETIME NOT NULL DEFAULT NOW(),
+      INDEX idx_ccd_customer (customer_id)
+    )
+  `);
+
+  // Fetch the cart row first so we know the price_type and product
+  const [rows] = await db.query(
+    'SELECT price_type, product_id FROM cart WHERE id = ? AND customer_id = ?',
+    [cartId, customerId]
+  );
+
+  // If it's a DEAL item, record the cancellation before deleting
+  if (rows.length && rows[0].price_type === 'DEAL') {
+    const { product_id } = rows[0];
+    // Find the most recent campaign for this product to link it
+    const [campRows] = await db.query(
+      'SELECT id FROM campaign WHERE product_id = ? ORDER BY id DESC LIMIT 1',
+      [product_id]
+    );
+    const campaignId = campRows.length ? campRows[0].id : null;
+    await db.query(
+      'INSERT INTO customer_cancelled_deal (customer_id, product_id, campaign_id) VALUES (?, ?, ?)',
+      [customerId, product_id, campaignId]
+    );
+  }
+
   // Remove by cartId so only the specific row (REGULAR or DEAL) is deleted
   await db.query('DELETE FROM cart WHERE id = ? AND customer_id = ?', [cartId, customerId]);
   return { message: 'Removed from cart' };

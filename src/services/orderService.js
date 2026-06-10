@@ -4,7 +4,6 @@ import * as shiprocket from './shiprocketService.js';
 
 const genOrderNumber = () => 'HK' + Date.now();
 
-/* Parse JSON-array or plain image_url and return a /seller-uploads/... path */
 const resolveImage = (raw) => {
   if (!raw) return null;
   let first = raw;
@@ -44,7 +43,7 @@ export const placeOrder = async ({
     const depositPaid = isDealItem ? (Number(cartRow[0].deposit_paid) || 0) : 0;
     const amount      = Math.max(0, lockedPrice * item.quantity - depositPaid);
 
-    // Try to add fee columns — ignore if they already exist
+    // Add fee columns if missing (safe to call multiple times)
     try {
       await db.query(`ALTER TABLE orders
         ADD COLUMN delivery_charge DECIMAL(10,2) DEFAULT 0,
@@ -93,12 +92,8 @@ export const placeOrder = async ({
 
     results.push({ orderId: r.insertId, orderNumber, productName: p.product_name, amount });
 
-    // Create Shiprocket order and store tracking info
+    // ── Shiprocket: create order, assign AWB, store in shipping table ──
     try {
-      await db.query(`ALTER TABLE orders ADD COLUMN shiprocket_order_id VARCHAR(100) DEFAULT NULL`, []).catch(() => {});
-      await db.query(`ALTER TABLE orders ADD COLUMN shiprocket_shipment_id VARCHAR(100) DEFAULT NULL`, []).catch(() => {});
-      await db.query(`ALTER TABLE orders ADD COLUMN awb_code VARCHAR(100) DEFAULT NULL`, []).catch(() => {});
-
       const orderDateStr = new Date().toISOString().replace('T', ' ').substring(0, 16);
       const sr = await shiprocket.createShiprocketOrder({
         orderId:       r.insertId,
@@ -116,16 +111,52 @@ export const placeOrder = async ({
         price:         lockedPrice,
       });
 
+      // Try to auto-assign AWB + get label if shipment_id is available
+      let awbCode   = sr.awbCode;
+      let courierId = sr.courierId;
+      let labelUrl  = null;
+      let trackingUrl = awbCode ? `https://shiprocket.co/tracking/${awbCode}` : null;
+
+      if (sr.shiprocketShipmentId && !awbCode) {
+        try {
+          const assigned = await shiprocket.assignAwbAndLabel(sr.shiprocketShipmentId);
+          awbCode    = assigned.awbCode    || awbCode;
+          courierId  = assigned.courierId  || courierId;
+          labelUrl   = assigned.labelUrl;
+          trackingUrl = awbCode ? `https://shiprocket.co/tracking/${awbCode}` : null;
+        } catch (e) {
+          console.warn('[orderService] AWB assign failed:', e.message);
+        }
+      }
+
+      // Upsert into shipping table using the new columns
       await db.query(
-        'UPDATE orders SET shiprocket_order_id = ?, shiprocket_shipment_id = ?, awb_code = ? WHERE id = ?',
-        [sr.shiprocketOrderId, sr.shiprocketShipmentId, sr.awbCode, r.insertId]
+        `INSERT INTO shipping
+           (order_id, shiprocket_order_id, shiprocket_shipment_id, awb_code, courier_id, label_url, tracking_url, tracking_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+         ON DUPLICATE KEY UPDATE
+           shiprocket_order_id  = VALUES(shiprocket_order_id),
+           shiprocket_shipment_id = VALUES(shiprocket_shipment_id),
+           awb_code             = VALUES(awb_code),
+           courier_id           = VALUES(courier_id),
+           label_url            = VALUES(label_url),
+           tracking_url         = VALUES(tracking_url)`,
+        [
+          r.insertId,
+          sr.shiprocketOrderId    || null,
+          sr.shiprocketShipmentId || null,
+          awbCode                 || null,
+          courierId               || null,
+          labelUrl                || null,
+          trackingUrl             || null,
+        ]
       );
     } catch (srErr) {
       console.error('[orderService] Shiprocket error:', srErr.message);
-      // Don't fail the order if Shiprocket is down — order is still placed
+      // Order is still placed — Shiprocket failure is non-fatal
     }
 
-    // Record customer transaction for this order item
+    // Record transaction
     try {
       await txSvc.record({
         customerId,
@@ -143,7 +174,6 @@ export const placeOrder = async ({
     }
   }
 
-  // Remove only the ordered items from cart, not the entire cart
   for (const item of items) {
     await db.query('DELETE FROM cart WHERE customer_id = ? AND product_id = ?', [customerId, item.productId]);
   }
@@ -152,13 +182,18 @@ export const placeOrder = async ({
 
 export const trackOrder = async (orderId, customerId) => {
   const [rows] = await db.query(
-    'SELECT id, order_number, order_status, delivery_status, awb_code, shiprocket_order_id FROM orders WHERE id = ? AND customer_id = ?',
+    `SELECT o.id, o.order_number, o.order_status, o.delivery_status,
+            s.awb_code, s.shiprocket_order_id, s.shiprocket_shipment_id,
+            s.tracking_url, s.label_url, s.courier_id
+     FROM orders o
+     LEFT JOIN shipping s ON s.order_id = o.id
+     WHERE o.id = ? AND o.customer_id = ?`,
     [orderId, customerId]
   );
   if (!rows.length) throw Object.assign(new Error('Order not found'), { status: 404 });
   const order = rows[0];
 
-  // If we have an AWB code, get live tracking from Shiprocket
+  // If AWB exists, fetch live tracking from Shiprocket
   if (order.awb_code) {
     try {
       const tracking = await shiprocket.trackByAwb(order.awb_code);
@@ -167,10 +202,44 @@ export const trackOrder = async (orderId, customerId) => {
         orderStatus:    order.order_status,
         deliveryStatus: order.delivery_status,
         awbCode:        order.awb_code,
+        labelUrl:       order.label_url,
         tracking,
       };
     } catch (e) {
       console.error('[trackOrder] Shiprocket tracking error:', e.message);
+    }
+  }
+
+  // If Shiprocket order was created but AWB not yet assigned — try assigning now
+  if (order.shiprocket_shipment_id && !order.awb_code) {
+    try {
+      const assigned = await shiprocket.assignAwbAndLabel(order.shiprocket_shipment_id);
+      if (assigned.awbCode) {
+        await db.query(
+          'UPDATE shipping SET awb_code = ?, courier_id = ?, label_url = ?, tracking_url = ? WHERE order_id = ?',
+          [
+            assigned.awbCode,
+            assigned.courierId || null,
+            assigned.labelUrl  || null,
+            `https://shiprocket.co/tracking/${assigned.awbCode}`,
+            orderId,
+          ]
+        );
+        // Now fetch live tracking with the new AWB
+        try {
+          const tracking = await shiprocket.trackByAwb(assigned.awbCode);
+          return {
+            orderNumber:    order.order_number,
+            orderStatus:    order.order_status,
+            deliveryStatus: order.delivery_status,
+            awbCode:        assigned.awbCode,
+            labelUrl:       assigned.labelUrl || null,
+            tracking,
+          };
+        } catch {}
+      }
+    } catch (e) {
+      console.warn('[trackOrder] AWB re-assign attempt failed:', e.message);
     }
   }
 
@@ -179,7 +248,8 @@ export const trackOrder = async (orderId, customerId) => {
     orderNumber:    order.order_number,
     orderStatus:    order.order_status,
     deliveryStatus: order.delivery_status,
-    awbCode:        order.awb_code || null,
+    awbCode:        order.awb_code    || null,
+    labelUrl:       order.label_url   || null,
     tracking:       null,
   };
 };
@@ -194,10 +264,12 @@ export const listOrders = async (customerId) => {
        (SELECT COUNT(*) FROM review rv
         WHERE rv.customer_id = o.customer_id
           AND rv.product_id = o.product_id) AS has_reviewed,
-       p.image_url AS product_image_raw
+       p.image_url AS product_image_raw,
+       sh.awb_code, sh.tracking_url, sh.label_url
      FROM orders o
      LEFT JOIN seller s ON s.id = o.seller_id
      LEFT JOIN product p ON p.id = o.product_id
+     LEFT JOIN shipping sh ON sh.order_id = o.id
      WHERE o.customer_id = ? ORDER BY o.created_date DESC`,
     [customerId]
   );
@@ -210,10 +282,13 @@ export const listOrders = async (customerId) => {
 export const getOrder = async (orderId, customerId) => {
   const [rows] = await db.query(
     `SELECT o.*, s.business_name AS sellerName, s.email AS sellerEmail,
-       p.image_url AS product_image_raw
+       p.image_url AS product_image_raw,
+       sh.awb_code, sh.shiprocket_order_id, sh.shiprocket_shipment_id,
+       sh.tracking_url, sh.label_url, sh.courier_id
      FROM orders o
      LEFT JOIN seller s ON s.id = o.seller_id
      LEFT JOIN product p ON p.id = o.product_id
+     LEFT JOIN shipping sh ON sh.order_id = o.id
      WHERE o.id = ? AND o.customer_id = ?`,
     [orderId, customerId]
   );
@@ -255,6 +330,16 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
      VALUES (?, ?, ?, ?, ?, 'Pending', NOW())`,
     [orderId, customerId, order.seller_id, cancellation_reason || null, resType]
   );
+
+  // Cancel on Shiprocket if we have the order ID
+  try {
+    const [shRows] = await db.query('SELECT shiprocket_order_id FROM shipping WHERE order_id = ?', [orderId]);
+    if (shRows[0]?.shiprocket_order_id) {
+      await shiprocket.cancelShiprocketOrder(shRows[0].shiprocket_order_id);
+    }
+  } catch (e) {
+    console.warn('[cancelOrder] Shiprocket cancel failed:', e.message);
+  }
 
   await db.query(
     'INSERT INTO customer_notification (customer_id, title, message, type) VALUES (?,?,?,?)',

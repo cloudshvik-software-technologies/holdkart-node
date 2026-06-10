@@ -3,7 +3,6 @@ const BASE_URL = 'https://apiv2.shiprocket.in/v1/external';
 let _token = null;
 let _tokenExpiry = 0;
 
-/* ── Auth: get token, cache it for 23 hours ── */
 async function getToken() {
   if (_token && Date.now() < _tokenExpiry) return _token;
 
@@ -19,7 +18,7 @@ async function getToken() {
   if (!data.token) throw new Error('Shiprocket auth failed: ' + JSON.stringify(data));
 
   _token       = data.token;
-  _tokenExpiry = Date.now() + 23 * 60 * 60 * 1000; // 23 hours
+  _tokenExpiry = Date.now() + 23 * 60 * 60 * 1000;
   return _token;
 }
 
@@ -30,18 +29,18 @@ async function headers() {
   };
 }
 
-/* ── Create a Shiprocket order after customer places order ── */
+/* ── Create a Shiprocket order ── */
 export async function createShiprocketOrder({
   orderId, orderNumber, orderDate,
   customerName, customerEmail, customerPhone,
   address, city, pincode, state,
   productName, quantity, price,
-  weight = 0.5,  // kg — update per product if needed
+  weight = 0.5,
 }) {
   const body = {
     order_id:          String(orderNumber),
-    order_date:        orderDate,  // "YYYY-MM-DD HH:mm"
-    pickup_location:   'Primary',  // must match your Shiprocket warehouse name
+    order_date:        orderDate,
+    pickup_location:   'Primary',
     billing_customer_name:  customerName,
     billing_address:        address,
     billing_city:           city,
@@ -59,7 +58,7 @@ export async function createShiprocketOrder({
         selling_price: price,
       },
     ],
-    payment_method: 'Prepaid',   // always Prepaid for online orders
+    payment_method: 'Prepaid',
     sub_total:      price * quantity,
     length:         10,
     breadth:        10,
@@ -75,13 +74,47 @@ export async function createShiprocketOrder({
   const data = await res.json();
   if (!res.ok) throw new Error('Shiprocket order creation failed: ' + JSON.stringify(data));
 
-  // Returns { order_id, shipment_id, status, ... }
   return {
-    shiprocketOrderId:   data.order_id   || null,
+    shiprocketOrderId:    data.order_id    || null,
     shiprocketShipmentId: data.shipment_id || null,
-    awbCode:             data.awb_code   || null,
-    status:              data.status     || null,
+    awbCode:              data.awb_code    || null,
+    courierId:            data.courier_id  || null,
+    status:               data.status      || null,
   };
+}
+
+/* ── Assign AWB (auto-assign cheapest courier) and get label URL ── */
+export async function assignAwbAndLabel(shipmentId) {
+  // 1. Auto-assign courier
+  const assignRes = await fetch(`${BASE_URL}/courier/assign/awb`, {
+    method: 'POST',
+    headers: await headers(),
+    body: JSON.stringify({ shipment_id: [String(shipmentId)] }),
+  });
+  const assignData = await assignRes.json();
+
+  const awbCode   = assignData?.response?.data?.awb_code   || null;
+  const courierId = assignData?.response?.data?.courier_id || null;
+
+  if (!awbCode) {
+    console.warn('[shiprocket] AWB assign response:', JSON.stringify(assignData));
+  }
+
+  // 2. Generate label
+  let labelUrl = null;
+  try {
+    const labelRes = await fetch(`${BASE_URL}/courier/generate/label`, {
+      method: 'POST',
+      headers: await headers(),
+      body: JSON.stringify({ shipment_id: [String(shipmentId)] }),
+    });
+    const labelData = await labelRes.json();
+    labelUrl = labelData?.label_url || null;
+  } catch (e) {
+    console.warn('[shiprocket] Label generation failed:', e.message);
+  }
+
+  return { awbCode, courierId, labelUrl };
 }
 
 /* ── Track shipment by AWB code ── */
@@ -99,6 +132,7 @@ export async function trackByAwb(awbCode) {
     etd:            info.etd                 || null,
     courierName:    info.courier_name        || null,
     awbCode:        info.awb_code            || awbCode,
+    trackingUrl:    info.track_url           || `https://shiprocket.co/tracking/${awbCode}`,
     activities:     data.tracking_data?.shipment_track_activities || [],
   };
 }

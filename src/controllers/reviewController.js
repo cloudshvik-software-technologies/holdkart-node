@@ -59,8 +59,28 @@ export const getReviewedProducts = async (req, res) => {
 
 export const getProductReviews = async (req, res) => {
   try {
-    res.json(await svc.getProductReviews(req.params.productId));
+    // Pass customer id if authenticated (Bearer token present), otherwise null
+    let customerId = null;
+    const header = req.headers.authorization;
+    if (header && header.startsWith('Bearer ')) {
+      try {
+        const { verifyToken } = await import('../config/jwt.js');
+        const decoded = verifyToken(header.split(' ')[1]);
+        customerId = decoded.id;
+      } catch { /* token invalid or absent — treat as guest */ }
+    }
+    res.json(await svc.getProductReviews(req.params.productId, customerId));
   } catch (e) {
     res.status(500).json({ message: e.message });
+  }
+};
+
+export const toggleReviewLike = async (req, res) => {
+  try {
+    const { reviewId } = req.params;
+    const result = await svc.toggleReviewLike({ customerId: req.customer.id, reviewId });
+    res.json(result);
+  } catch (e) {
+    res.status(e.status || 500).json({ message: e.message });
   }
 };

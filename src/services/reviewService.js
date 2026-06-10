@@ -111,9 +111,10 @@ export const getReviewedProducts = async (customerId) => {
   return rows.map(r => String(r.product_id));
 };
 
-export const getProductReviews = async (productId) => {
+export const getProductReviews = async (productId, customerId = null) => {
   const [rows] = await db.query(
-    `SELECT r.*, c.name AS customerName
+    `SELECT r.*, c.name AS customerName,
+            (SELECT COUNT(*) FROM review_like rl WHERE rl.review_id = r.id) AS likes
      FROM review r
      JOIN customer c ON c.id = r.customer_id
      WHERE r.product_id = ?
@@ -121,14 +122,68 @@ export const getProductReviews = async (productId) => {
     [productId]
   );
 
-  // Attach images to each review
+  // Attach images and current customer's vote to each review
   for (const row of rows) {
     const [imgs] = await db.query(
       'SELECT image_path FROM review_image WHERE review_id = ? ORDER BY id ASC',
       [row.id]
     );
     row.images = imgs.map(i => i.image_path);
+    row.likes = Number(row.likes) || 0;
+
+    if (customerId) {
+      const [vote] = await db.query(
+        'SELECT id FROM review_like WHERE review_id = ? AND customer_id = ?',
+        [row.id, customerId]
+      );
+      row.userVote = vote.length > 0 ? 'like' : null;
+    } else {
+      row.userVote = null;
+    }
   }
 
   return rows;
+};
+
+/**
+ * Toggle a like on a review. One like per customer per review.
+ * Returns the new like count and the customer's current vote state.
+ */
+export const toggleReviewLike = async ({ customerId, reviewId }) => {
+  // Ensure the review exists
+  const [rev] = await db.query('SELECT id FROM review WHERE id = ?', [reviewId]);
+  if (!rev.length) {
+    throw Object.assign(new Error('Review not found.'), { status: 404 });
+  }
+
+  // Check if this customer already liked this review
+  const [existing] = await db.query(
+    'SELECT id FROM review_like WHERE review_id = ? AND customer_id = ?',
+    [reviewId, customerId]
+  );
+
+  let userVote;
+  if (existing.length > 0) {
+    // Already liked — remove the like
+    await db.query(
+      'DELETE FROM review_like WHERE review_id = ? AND customer_id = ?',
+      [reviewId, customerId]
+    );
+    userVote = null;
+  } else {
+    // Not yet liked — add the like
+    await db.query(
+      'INSERT INTO review_like (review_id, customer_id) VALUES (?, ?)',
+      [reviewId, customerId]
+    );
+    userVote = 'like';
+  }
+
+  // Return updated total like count
+  const [[{ likes }]] = await db.query(
+    'SELECT COUNT(*) AS likes FROM review_like WHERE review_id = ?',
+    [reviewId]
+  );
+
+  return { likes: Number(likes), userVote };
 };
