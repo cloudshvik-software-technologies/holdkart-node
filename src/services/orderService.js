@@ -1,8 +1,103 @@
 import db from '../config/db.js';
 import * as txSvc from './transactionService.js';
 import * as shiprocket from './shiprocketService.js';
+import { sendOrderPlacedEmail, sendInvoiceEmail, sendOrderShippedEmail, sendOrderDeliveredEmail, sendRefundProcessedEmail } from '../config/email.js';
 
 const genOrderNumber = () => 'HK' + Date.now();
+
+// Ensure the tracking columns exist (safe to call multiple times)
+const ensureEmailTrackingColumns = async () => {
+  try {
+    await db.query(`ALTER TABLE orders
+      ADD COLUMN delivered_email_sent_at DATETIME NULL,
+      ADD COLUMN invoice_email_sent_at DATETIME NULL`);
+  } catch {}
+};
+
+const buildInvoicePayload = (order) => ({
+  name:          order.customer_name || order.customerName || 'Customer',
+  orderNumber:   order.order_number,
+  productName:   order.product_name,
+  quantity:      order.quantity || 1,
+  amount:        order.order_amount,
+  address:       [order.address, order.city, order.state, order.pincode].filter(Boolean).join(', '),
+  paymentMethod: order.payment_method,
+  orderDate:     order.order_date ? new Date(order.order_date).toLocaleDateString('en-IN') : null,
+  category:      order.category,
+  sellerName:    order.sellerName || null,
+  sellerEmail:   order.sellerEmail || null,
+  phFee:         order.payment_handling_fee,
+  ppFee:         order.protect_promise_fee,
+});
+
+/**
+ * Marks the delivered email as sent (DB-backed, so it survives server restarts)
+ * and sends it, if not already sent. The invoice email itself is NOT sent here;
+ * it is picked up by the invoice email poller 10 minutes later.
+ * Returns true if the delivered email was sent by this call.
+ */
+const markDeliveredAndSendEmail = async (order, email) => {
+  await ensureEmailTrackingColumns();
+
+  const [result] = await db.query(
+    `UPDATE orders SET delivered_email_sent_at = NOW()
+     WHERE id = ? AND delivered_email_sent_at IS NULL`,
+    [order.id]
+  );
+  if (result.affectedRows === 0) return false; // already sent previously
+
+  if (email) {
+    const base = { name: order.customer_name || order.customerName || 'Customer', orderNumber: order.order_number, productName: order.product_name };
+    await sendOrderDeliveredEmail(email, base).catch(e => console.error('[markDeliveredAndSendEmail] delivered email error:', e.message));
+  }
+  return true;
+};
+
+/**
+ * Poller: every minute, find orders whose delivered email was sent at least
+ * 10 minutes ago and whose invoice email hasn't been sent yet, then send the
+ * invoice email and stamp invoice_email_sent_at. DB-backed, so a server
+ * restart simply means the next poll tick picks up any due orders.
+ */
+export const startInvoiceEmailPoller = () => {
+  const runOnce = async () => {
+    try {
+      await ensureEmailTrackingColumns();
+
+      const [rows] = await db.query(
+        `SELECT o.*, s.business_name AS sellerName, s.email AS sellerEmail, c.email AS customerEmail, c.name AS customerName
+         FROM orders o
+         LEFT JOIN seller s ON s.id = o.seller_id
+         LEFT JOIN customer c ON c.id = o.customer_id
+         WHERE o.delivered_email_sent_at IS NOT NULL
+           AND o.invoice_email_sent_at IS NULL
+           AND o.delivered_email_sent_at <= (NOW() - INTERVAL 10 MINUTE)`
+      );
+
+      for (const order of rows) {
+        const email = order.customer_email || order.customerEmail;
+        // Stamp first to avoid double-sending if multiple poll ticks overlap
+        const [result] = await db.query(
+          `UPDATE orders SET invoice_email_sent_at = NOW()
+           WHERE id = ? AND invoice_email_sent_at IS NULL`,
+          [order.id]
+        );
+        if (result.affectedRows === 0) continue;
+
+        if (email) {
+          await sendInvoiceEmail(email, buildInvoicePayload(order))
+            .catch(e => console.error(`[invoiceEmailPoller] invoice email error for order ${order.id}:`, e.message));
+        }
+      }
+    } catch (e) {
+      console.error('[invoiceEmailPoller] poll error:', e.message);
+    }
+  };
+
+  // Run shortly after startup, then every minute
+  runOnce();
+  setInterval(runOnce, 60 * 1000);
+};
 
 const resolveImage = (raw) => {
   if (!raw) return null;
@@ -89,6 +184,23 @@ export const placeOrder = async ({
       'INSERT INTO customer_notification (customer_id, title, message, type) VALUES (?,?,?,?)',
       [customerId, 'Order Placed!', `Your order ${orderNumber} for ${p.product_name} has been placed.`, 'ORDER']
     );
+
+    // Send order placed + invoice email
+    try {
+      const emailData = {
+        name: customer?.name || '',
+        orderNumber,
+        productName: p.product_name,
+        quantity: item.quantity,
+        amount,
+        address: `${address}, ${city}, ${state} - ${pincode}`,
+        paymentMethod,
+        orderDate: new Date().toLocaleDateString('en-IN'),
+      };
+      await sendOrderPlacedEmail(customer?.email || '', emailData);
+    } catch (emailErr) {
+      console.error('[orderService] order email error:', emailErr.message);
+    }
 
     results.push({ orderId: r.insertId, orderNumber, productName: p.product_name, amount });
 
@@ -293,7 +405,13 @@ export const getOrder = async (orderId, customerId) => {
     [orderId, customerId]
   );
   if (!rows[0]) return null;
-  return { ...rows[0], product_image: resolveImage(rows[0].product_image_raw) };
+  const order = { ...rows[0], product_image: resolveImage(rows[0].product_image_raw) };
+
+  if (order.order_status === 'Delivered') {
+    await markDeliveredAndSendEmail(order, order.customer_email);
+  }
+
+  return order;
 };
 
 export const cancelOrder = async ({ orderId, customerId, cancellation_reason, resolution_type }) => {
@@ -352,4 +470,54 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
   );
 
   return { message: 'Cancellation request submitted successfully' };
+};
+
+/**
+ * updateOrderStatus — called by seller panel to update order/delivery status.
+ * Sends email notifications for Shipped, Delivered, and Refund Processed.
+ */
+export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, refundAmount }) => {
+  const [rows] = await db.query(
+    `SELECT o.*, c.name AS customerName, c.email AS customerEmail,
+            sh.awb_code, sh.tracking_url
+     FROM orders o
+     LEFT JOIN customer c ON c.id = o.customer_id
+     LEFT JOIN shipping sh ON sh.order_id = o.id
+     WHERE o.id = ?`,
+    [orderId]
+  );
+  if (!rows.length) { const e = new Error('Order not found'); e.status = 404; throw e; }
+  const order = rows[0];
+
+  const updateFields = [];
+  const updateValues = [];
+  if (orderStatus)   { updateFields.push('order_status = ?');   updateValues.push(orderStatus); }
+  if (deliveryStatus){ updateFields.push('delivery_status = ?'); updateValues.push(deliveryStatus); }
+  if (updateFields.length) {
+    await db.query(`UPDATE orders SET ${updateFields.join(', ')} WHERE id = ?`, [...updateValues, orderId]);
+  }
+
+  const email = order.customerEmail || order.customer_email;
+  const name  = order.customerName  || order.customer_name || 'Customer';
+  const base  = { name, orderNumber: order.order_number, productName: order.product_name };
+
+  try {
+    if (deliveryStatus === 'Shipped' || orderStatus === 'Shipped') {
+      await sendOrderShippedEmail(email, {
+        ...base,
+        awbCode:     order.awb_code    || null,
+        trackingUrl: order.tracking_url || null,
+        courierName: null,
+      });
+    } else if (deliveryStatus === 'Delivered' || orderStatus === 'Delivered') {
+      // Invoice email will be sent ~10 minutes later by the invoice email poller
+      await markDeliveredAndSendEmail(order, email);
+    } else if (orderStatus === 'Refund Processed' || orderStatus === 'Refunded') {
+      await sendRefundProcessedEmail(email, { ...base, refundAmount: refundAmount || order.order_amount });
+    }
+  } catch (emailErr) {
+    console.error('[updateOrderStatus] email error:', emailErr.message);
+  }
+
+  return { message: 'Order status updated successfully' };
 };

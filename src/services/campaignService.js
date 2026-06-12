@@ -1,4 +1,5 @@
 import db from '../config/db.js';
+import { sendDealJoinedEmail, sendDealTargetReachedEmail } from '../config/email.js';
 import * as txSvc from './transactionService.js';
 
 export const listCampaigns = async () => {
@@ -305,6 +306,25 @@ export const startOrJoinCampaign = async ({ customerId, productId, quantity = 1,
     console.error('[campaignService] transaction record error:', txErr.message);
   }
 
+  // Send deal joined email
+  try {
+    const [crows] = await db.query('SELECT name, email FROM customer WHERE id = ?', [customerId]);
+    if (crows.length && crows[0].email) {
+      const [prRows] = await db.query('SELECT product_name, hold_price, retail_price FROM product WHERE id = ?', [productId]);
+      await sendDealJoinedEmail(crows[0].email, {
+        name:          crows[0].name,
+        productName:   prRows[0]?.product_name || 'Product',
+        quantity,
+        depositAmount,
+        campaignId:    campaign.id,
+        holdPrice:     prRows[0]?.hold_price   || null,
+        retailPrice:   prRows[0]?.retail_price || null,
+      });
+    }
+  } catch (emailErr) {
+    console.error('[campaignService] join deal email error:', emailErr.message);
+  }
+
   return { message: 'You have joined the group deal!', campaignId: campaign.id };
 };
 
@@ -504,6 +524,22 @@ async function _completeCampaignAndReset(campaign) {
         'CAMPAIGN',
       ]
     );
+
+    // Send deal target reached email
+    try {
+      const [crows] = await db.query('SELECT email FROM customer WHERE id = ?', [h.customer_id]);
+      if (crows.length && crows[0].email) {
+        const [cnameRows] = await db.query('SELECT name FROM customer WHERE id = ?', [h.customer_id]);
+        await sendDealTargetReachedEmail(crows[0].email, {
+          name:        cnameRows[0]?.name || 'Customer',
+          productName,
+          holdPrice:   lockedPrice,
+          quantity:    slotCount,
+        });
+      }
+    } catch (emailErr) {
+      console.error('[campaignService] deal target email error:', emailErr.message);
+    }
   }
 
   await db.query('DELETE FROM campaign_hold WHERE campaign_id = ?', [campaign.id]);

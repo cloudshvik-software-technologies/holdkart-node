@@ -9,6 +9,5 @@ r.put('/cancel',        c.cancelOrder);
 r.put('/return',        c.returnOrder);
 r.get('/track/:orderId', c.trackOrder);
 r.get('/:orderId',      c.getOrder);
+r.put('/:orderId/status', c.updateOrderStatus);
 export default r;
-
-
