@@ -17,6 +17,7 @@
     "mysql2": "^3.9.7",
     "node-fetch": "^3.3.2",
     "nodemailer": "^6.9.13",
+    "pdfkit": "^0.19.1",
     "razorpay": "^2.9.2",
     "uuid": "^9.0.1"
   },

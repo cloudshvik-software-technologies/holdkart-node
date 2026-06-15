@@ -521,3 +521,56 @@ export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, 
 
   return { message: 'Order status updated successfully' };
 };
+
+/**
+ * returnOrder — customer requests a return/replace for a delivered order.
+ * Only allowed when order_status is 'Delivered'.
+ * Uses the same order_cancel_request table as cancellations.
+ */
+export const returnOrder = async ({ orderId, customerId, cancellation_reason, resolution_type }) => {
+  const [rows] = await db.query('SELECT * FROM orders WHERE id = ? AND customer_id = ?', [orderId, customerId]);
+  if (!rows.length) { const e = new Error('Order not found'); e.status = 404; throw e; }
+  const order = rows[0];
+
+  if (order.order_status !== 'Delivered') {
+    const e = new Error('Return requests are only allowed for delivered orders'); e.status = 400; throw e;
+  }
+
+  const resType = ['Refund', 'Replace'].includes(resolution_type) ? resolution_type : 'Refund';
+
+  if (resType === 'Replace') {
+    const [existing] = await db.query(
+      `SELECT id FROM order_cancel_request WHERE order_id = ? AND resolution_type = 'Replace' AND status = 'Approved' LIMIT 1`,
+      [orderId]
+    );
+    if (existing.length) {
+      const e = new Error('A replacement has already been used for this order. Only one replacement is allowed.');
+      e.status = 400;
+      throw e;
+    }
+  }
+
+  await db.query(
+    "UPDATE orders SET order_status = 'Return Requested', cancellation_reason = ?, resolution_type = ? WHERE id = ?",
+    [cancellation_reason || null, resType, orderId]
+  );
+
+  await db.query(
+    `INSERT INTO order_cancel_request
+       (order_id, customer_id, seller_id, cancellation_reason, resolution_type, status, created_at)
+     VALUES (?, ?, ?, ?, ?, 'Pending', NOW())`,
+    [orderId, customerId, order.seller_id, cancellation_reason || null, resType]
+  );
+
+  await db.query(
+    'INSERT INTO customer_notification (customer_id, title, message, type) VALUES (?,?,?,?)',
+    [
+      customerId,
+      '🔄 Return Request Submitted',
+      `Your ${resType} request for order ${order.order_number} ("${order.product_name}") has been sent to the seller. You'll be notified within 24–48 hours.`,
+      'RETURN_REQUEST',
+    ]
+  );
+
+  return { message: 'Return request submitted successfully' };
+};
