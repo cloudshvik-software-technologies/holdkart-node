@@ -159,3 +159,37 @@ export async function cancelShiprocketOrder(shiprocketOrderIds) {
   if (!res.ok) throw new Error('Shiprocket cancel failed: ' + JSON.stringify(data));
   return data;
 }
+/* ── Check courier serviceability for a pincode pair ── */
+export async function getAvailableCouriers(originPincode, destPincode, weight = 0.5, cod = false, declaredValue = 500) {
+  const params = new URLSearchParams({
+    pickup_postcode:   String(originPincode),
+    delivery_postcode: String(destPincode),
+    weight:            String(weight),
+    cod:               cod ? 1 : 0,
+    declared_value:    String(declaredValue),
+  });
+
+  const res = await fetch(`${BASE_URL}/courier/serviceability/?${params}`, {
+    headers: await headers(),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error('Serviceability check failed: ' + JSON.stringify(data));
+
+  const companies =
+    data?.data?.available_courier_companies ||
+    data?.available_courier_companies ||
+    [];
+
+  return companies.map((c) => ({
+    courierId:      c.courier_company_id,
+    courierName:    c.courier_name,
+    rate:           parseFloat(c.rate || c.freight_charge || 0),
+    etaDays:        c.estimated_delivery_days || c.etd || '—',
+    cod:            !!c.cod,
+    minWeight:      c.min_weight || 0,
+    maxWeight:      c.max_weight || 0,
+    logo:           c.courier_logo_url || null,
+    ratingScore:    c.rating || null,
+    performanceSla: c.performance_sla || null,
+  }));
+}

@@ -19,6 +19,7 @@ import reviewRoutes          from './routes/review.js';
 import campaignRoutes        from './routes/campaign.js';
 import paymentRoutes         from './routes/payment.js';
 import advertisementRoutes   from './routes/advertisement.js';
+import shippingRoutes        from './routes/shipping.js';
 import { notFound, errorHandler } from './middleware/errorHandler.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -90,6 +91,7 @@ app.use('/api/customer/review',        reviewRoutes);
 app.use('/api/customer/campaign',      campaignRoutes);
 app.use('/api/customer/payment',       paymentRoutes);
 app.use('/api/customer/ads',           advertisementRoutes);
+app.use('/api/customer/shipping',      shippingRoutes);
 
 app.get('/health', (_req, res) => res.json({ status: 'OK', service: 'holdkart-customer-backend' }));
 
