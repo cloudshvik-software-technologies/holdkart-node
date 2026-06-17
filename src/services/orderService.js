@@ -1,6 +1,7 @@
 import db from '../config/db.js';
 import * as txSvc from './transactionService.js';
 import * as shiprocket from './shiprocketService.js';
+import * as paySvc from './paymentService.js';
 import { sendOrderPlacedEmail, sendInvoiceEmail, sendOrderShippedEmail, sendOrderDeliveredEmail, sendRefundProcessedEmail } from '../config/email.js';
 
 const genOrderNumber = () => 'HK' + Date.now();
@@ -118,6 +119,12 @@ export const placeOrder = async ({
 }) => {
   if (!items || !items.length) throw new Error('No items in order');
 
+  // One common order number for the whole checkout — every product placed
+  // together shares this. Each product still gets its own row, distinguished
+  // by a sub-order number (orderNumber + sequence).
+  const orderNumber = genOrderNumber();
+  let subSeq = 0;
+
   const results = [];
   for (const item of items) {
     const [prows] = await db.query('SELECT * FROM product WHERE id = ? AND active = 1', [item.productId]);
@@ -127,7 +134,8 @@ export const placeOrder = async ({
 
     const [crows] = await db.query('SELECT * FROM customer WHERE id = ?', [customerId]);
     const customer = crows[0];
-    const orderNumber = genOrderNumber();
+    subSeq += 1;
+    const subOrderNumber = `${orderNumber}-${subSeq}`;
 
     const [cartRow] = await db.query(
       "SELECT price_type, locked_price, deposit_paid FROM cart WHERE customer_id = ? AND product_id = ? AND price_type = 'DEAL' LIMIT 1",
@@ -138,6 +146,13 @@ export const placeOrder = async ({
     const depositPaid = isDealItem ? (Number(cartRow[0].deposit_paid) || 0) : 0;
     const amount      = Math.max(0, lockedPrice * item.quantity - depositPaid);
 
+    // Shipping for THIS product only. Multi-item checkout sends a per-item
+    // rate (item.deliveryCharge); fall back to the order-level value for
+    // single-item purchases (Buy Now), where it's already this item's own rate.
+    const itemDeliveryCharge = item.deliveryCharge != null
+      ? Number(item.deliveryCharge) || 0
+      : Number(deliveryCharge) || 0;
+
     // Add fee columns if missing (safe to call multiple times)
     try {
       await db.query(`ALTER TABLE orders
@@ -147,18 +162,23 @@ export const placeOrder = async ({
         ADD COLUMN protect_promise_fee DECIMAL(10,2) DEFAULT 0`);
     } catch {}
 
+    // Add sub_order_number column if missing (safe to call multiple times)
+    try {
+      await db.query(`ALTER TABLE orders ADD COLUMN sub_order_number VARCHAR(60) DEFAULT NULL`);
+    } catch {}
+
     const [r] = await db.query(
-      `INSERT INTO orders (order_number, product_id, seller_id, customer_id, quantity, order_amount,
+      `INSERT INTO orders (order_number, sub_order_number, product_id, seller_id, customer_id, quantity, order_amount,
         order_status, order_date, payment_status, delivery_status, address, category,
         product_name, customer_name, created_date, payment_method, customer_email, customer_phone,
         city, pincode, state, delivery_charge, platform_fee, payment_handling_fee, protect_promise_fee)
-       VALUES (?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?)`,
-      [orderNumber, p.id, p.seller_id, customerId, item.quantity, amount,
+       VALUES (?,?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?)`,
+      [orderNumber, subOrderNumber, p.id, p.seller_id, customerId, item.quantity, amount,
        paymentMethod === 'Online' ? 'Paid' : 'Pending',
        'Pending', address, p.category, p.product_name,
        customer?.name || '', paymentMethod,
        customer?.email || '', customer?.mobile || '', city, pincode, state,
-       Number(deliveryCharge) || 0, Number(platformFee) || 0,
+       Number(itemDeliveryCharge) || 0, Number(platformFee) || 0,
        Number(paymentHandlingFee) || 0, Number(protectPromiseFee) || 0]
     );
 
@@ -202,7 +222,7 @@ export const placeOrder = async ({
       console.error('[orderService] order email error:', emailErr.message);
     }
 
-    results.push({ orderId: r.insertId, orderNumber, productName: p.product_name, amount });
+    results.push({ orderId: r.insertId, orderNumber, subOrderNumber, productName: p.product_name, amount });
 
     // ── Shiprocket: create order, assign AWB, store in shipping table ──
     try {
@@ -419,12 +439,141 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
   if (!rows.length) { const e = new Error('Order not found'); e.status = 404; throw e; }
   const order = rows[0];
 
-  if (!['Pending', 'Confirmed'].includes(order.order_status)) {
+  if (!['Pending', 'Confirmed', 'Shipped'].includes(order.order_status)) {
     const e = new Error('Cannot request cancellation for this order'); e.status = 400; throw e;
   }
 
-  const resType = ['Refund', 'Replace'].includes(resolution_type) ? resolution_type : 'Refund';
+  // Replacement is only available post-delivery; before/during shipment → Refund/Cancellation only
+  const resType = 'Refund';
 
+  const isPreShipment = ['Pending', 'Confirmed'].includes(order.order_status);
+  const isOnline      = (order.payment_method || '').toUpperCase() === 'ONLINE';
+
+  // ── PRE-SHIPMENT: Holdkart approves immediately ──────────────────────────────
+  if (isPreShipment) {
+    if (isOnline) {
+      // Find the Cashfree order_id from the transaction table
+      const [txRows] = await db.query(
+        `SELECT cashfree_order_id FROM customer_transaction
+         WHERE order_id = ? AND cashfree_order_id IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+        [orderId]
+      );
+      const cashfreeOrderId = txRows[0]?.cashfree_order_id;
+
+      if (cashfreeOrderId) {
+        // Initiate Cashfree refund immediately
+        const refundId = `refund_${orderId}_${Date.now()}`;
+        try {
+          await paySvc.initiateRefund({
+            cashfreeOrderId,
+            refundId,
+            amount:  order.order_amount,
+            note:    `Order ${order.order_number} cancelled — ${cancellation_reason || 'Customer request'}`,
+          });
+        } catch (refundErr) {
+          console.error('[cancelOrder] Cashfree refund error:', refundErr.message);
+          // Still proceed with cancellation; mark refund as pending so it can be retried
+        }
+
+        // Record refund transaction
+        await txSvc.record({
+          customerId,
+          orderId,
+          orderNumber:     order.order_number,
+          amount:          order.order_amount,
+          type:            'REFUND',
+          method:          'Online',
+          status:          'SUCCESS',
+          description:     `Refund for cancelled order ${order.order_number} — ${order.product_name}`,
+          cashfreeOrderId,
+        });
+      }
+
+      // Mark order as Cancelled + Refunded immediately
+      await db.query(
+        `UPDATE orders SET order_status = 'Cancelled', payment_status = 'Refunded',
+         cancellation_reason = ?, resolution_type = ? WHERE id = ?`,
+        [cancellation_reason || null, resType, orderId]
+      );
+
+      // Record in cancel request table as already approved
+      await db.query(
+        `INSERT INTO order_cancel_request
+           (order_id, customer_id, seller_id, cancellation_reason, resolution_type, status, created_at)
+         VALUES (?, ?, ?, ?, ?, 'Approved', NOW())`,
+        [orderId, customerId, order.seller_id, cancellation_reason || null, resType]
+      );
+
+      // Restore stock
+      await db.query(
+        'UPDATE product SET stock_quantity = stock_quantity + ? WHERE id = ?',
+        [order.quantity || 1, order.product_id]
+      );
+
+      // Send refund email
+      try {
+        const [cRows] = await db.query('SELECT email FROM customer WHERE id = ?', [customerId]);
+        const email = cRows[0]?.email || order.customer_email;
+        if (email) {
+          await sendRefundProcessedEmail(email, {
+            name:        order.customer_name || 'Customer',
+            orderNumber: order.order_number,
+            productName: order.product_name,
+            refundAmount: order.order_amount,
+          });
+        }
+      } catch (emailErr) {
+        console.error('[cancelOrder] refund email error:', emailErr.message);
+      }
+
+      await db.query(
+        'INSERT INTO customer_notification (customer_id, title, message, type) VALUES (?,?,?,?)',
+        [
+          customerId,
+          '✅ Order Cancelled & Refund Initiated',
+          `Your order ${order.order_number} for "${order.product_name}" has been cancelled. ₹${order.order_amount} refund has been initiated to your original payment method and will reflect within 5–7 business days.`,
+          'CANCEL_REQUEST',
+        ]
+      );
+
+      return { message: 'Order cancelled and refund initiated successfully' };
+
+    } else {
+      // COD pre-shipment: just cancel immediately, no money to refund
+      await db.query(
+        `UPDATE orders SET order_status = 'Cancelled', cancellation_reason = ?, resolution_type = ? WHERE id = ?`,
+        [cancellation_reason || null, 'Refund', orderId]
+      );
+
+      await db.query(
+        `INSERT INTO order_cancel_request
+           (order_id, customer_id, seller_id, cancellation_reason, resolution_type, status, created_at)
+         VALUES (?, ?, ?, ?, ?, 'Approved', NOW())`,
+        [orderId, customerId, order.seller_id, cancellation_reason || null, 'Refund']
+      );
+
+      // Restore stock
+      await db.query(
+        'UPDATE product SET stock_quantity = stock_quantity + ? WHERE id = ?',
+        [order.quantity || 1, order.product_id]
+      );
+
+      await db.query(
+        'INSERT INTO customer_notification (customer_id, title, message, type) VALUES (?,?,?,?)',
+        [
+          customerId,
+          '✅ Order Cancelled',
+          `Your order ${order.order_number} for "${order.product_name}" has been cancelled successfully.`,
+          'CANCEL_REQUEST',
+        ]
+      );
+
+      return { message: 'Order cancelled successfully' };
+    }
+  }
+
+  // ── SHIPPED: requires seller approval (refund after seller approves) ─────────
   if (resType === 'Replace') {
     const [existing] = await db.query(
       `SELECT id FROM order_cancel_request WHERE order_id = ? AND resolution_type = 'Replace' AND status = 'Approved' LIMIT 1`,

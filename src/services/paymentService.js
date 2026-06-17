@@ -87,3 +87,38 @@ export const verifyWebhookSignature = ({ rawBody, signature, timestamp }) => {
     .digest('base64');
   return expected === signature;
 };
+
+/**
+ * Initiate a refund via Cashfree for a completed payment order.
+ * @param {object} params
+ * @param {string} params.cashfreeOrderId  - the Cashfree order_id used during payment
+ * @param {string} params.refundId         - unique refund ID (e.g. 'refund_<orderId>_<ts>')
+ * @param {number} params.amount           - amount to refund in INR
+ * @param {string} [params.note]           - optional refund note shown to customer
+ * Returns the Cashfree refund response object.
+ */
+export const initiateRefund = async ({ cashfreeOrderId, refundId, amount, note = 'Order cancelled by customer' }) => {
+  const body = {
+    refund_amount: Number(amount).toFixed(2),
+    refund_id:     refundId,
+    refund_note:   note,
+  };
+
+  const response = await fetch(`${CF_BASE_URL}/orders/${cashfreeOrderId}/refunds`, {
+    method: 'POST',
+    headers: {
+      'Content-Type':    'application/json',
+      'x-api-version':   '2023-08-01',
+      'x-client-id':     CASHFREE_APP_ID,
+      'x-client-secret': CASHFREE_SECRET_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.message || 'Cashfree refund initiation failed');
+  }
+
+  return data; // { cf_refund_id, refund_id, order_id, refund_amount, refund_status, ... }
+};
