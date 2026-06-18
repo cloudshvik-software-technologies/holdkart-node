@@ -37,18 +37,40 @@ export async function createShiprocketOrder({
   productName, quantity, price,
   weight = 0.5,
 }) {
+  // Log what we received so empty fields are visible in the terminal
+  console.log('[Shiprocket] createShiprocketOrder fields:', {
+    orderId, orderNumber, customerName, customerPhone,
+    address, city, pincode, state,
+  });
+
+  // Validate required fields before hitting Shiprocket — gives a clear error
+  // instead of the cryptic "Please add billing/shipping address first" 400.
+  const missing = [];
+  if (!customerName?.toString().trim())  missing.push('customerName');
+  if (!address?.toString().trim())       missing.push('address');
+  if (!city?.toString().trim())          missing.push('city');
+  if (!pincode?.toString().trim())       missing.push('pincode');
+  if (!customerPhone?.toString().trim()) missing.push('customerPhone');
+
+  if (missing.length) {
+    throw new Error(
+      `Shiprocket order #${orderNumber} missing required fields: ${missing.join(', ')}. ` +
+      `Ensure the customer has a saved address and phone number.`
+    );
+  }
+
   const body = {
     order_id:          String(orderNumber),
     order_date:        orderDate,
     pickup_location:   'Primary',
-    billing_customer_name:  customerName,
-    billing_address:        address,
-    billing_city:           city,
-    billing_pincode:        String(pincode),
-    billing_state:          state,
+    billing_customer_name:  customerName.toString().trim(),
+    billing_address:        address.toString().trim(),
+    billing_city:           city.toString().trim(),
+    billing_pincode:        pincode.toString().trim(),
+    billing_state:          state?.toString().trim() || city.toString().trim(),
     billing_country:        'India',
-    billing_email:          customerEmail,
-    billing_phone:          String(customerPhone),
+    billing_email:          customerEmail || '',
+    billing_phone:          customerPhone.toString().trim(),
     shipping_is_billing:    true,
     order_items: [
       {

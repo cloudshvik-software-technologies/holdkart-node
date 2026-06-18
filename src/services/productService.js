@@ -6,6 +6,12 @@ const parseImages = (raw) => {
   return [raw];
 };
 
+const parseSpecs = (raw) => {
+  if (!raw) return {};
+  if (typeof raw === 'object') return raw;
+  try { return JSON.parse(raw); } catch { return {}; }
+};
+
 const toProduct = (p) => {
   const images = parseImages(p.image_url);
   const currentHold    = Number(p.current_hold) || 0;
@@ -23,6 +29,7 @@ const toProduct = (p) => {
     stock, remainingStock, active: Boolean(p.active),
     warehouseLocation: p.warehouse_location,
     avgRating: Number(p.avg_rating) || 0, reviewCount: Number(p.review_count) || 0,
+    specs: parseSpecs(p.specs),
   };
 };
 
@@ -46,14 +53,17 @@ const PRODUCT_SELECT = `SELECT p.*,
     SELECT 1 FROM campaign c2 WHERE c2.product_id = p.id AND c2.status = 'ACTIVE' AND c2.target > 0
   )`;
 
-export const listProducts = async ({ search, category, minPrice, maxPrice, page = 1, limit = 20 }) => {
+export const listProducts = async ({ search, category, minPrice, maxPrice, rating, page = 1, limit = 20 }) => {
   let sql = PRODUCT_SELECT;
   const params = [];
   if (search)   { sql += ' AND p.product_name LIKE ?'; params.push(`%${search}%`); }
   if (category) { sql += ' AND p.category = ?';        params.push(category); }
   if (minPrice) { sql += ' AND p.retail_price >= ?';   params.push(minPrice); }
   if (maxPrice) { sql += ' AND p.retail_price <= ?';   params.push(maxPrice); }
-  sql += ' GROUP BY p.id ORDER BY p.id DESC LIMIT ? OFFSET ?';
+  sql += ' GROUP BY p.id';
+  // avg_rating is an aggregate alias, so the rating filter has to be a HAVING clause, not WHERE
+  if (rating) { sql += ' HAVING avg_rating >= ?'; params.push(Number(rating)); }
+  sql += ' ORDER BY p.id DESC LIMIT ? OFFSET ?';
   const offset = (Number(page) - 1) * Number(limit);
   params.push(Number(limit), offset);
   const [rows] = await db.query(sql, params);

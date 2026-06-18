@@ -6,6 +6,12 @@ const parseImages = (raw) => {
   return [raw];
 };
 
+const parseSpecs = (raw) => {
+  if (!raw) return {};
+  if (typeof raw === 'object') return raw;
+  try { return JSON.parse(raw); } catch { return {}; }
+};
+
 export const addToCart = async ({ customerId, productId, quantity = 1 }) => {
   // Only allow adding to cart when an ACTIVE campaign exists for this product.
   // The available quantity is total stock minus the slots already committed in
@@ -67,6 +73,7 @@ export const getCart = async (customerId) => {
        p.stock_quantity AS stock,
        p.category,
        p.hold_target    AS holdTarget,
+       p.specs,
        (SELECT cam.hold_price FROM campaign cam
         WHERE cam.product_id = c.product_id AND cam.hold_price > 0
         ORDER BY cam.id DESC LIMIT 1) AS campaignHoldPrice,
@@ -82,6 +89,11 @@ export const getCart = async (customerId) => {
 
   return rows.map(r => {
     const hasGroupDeal   = r.priceType === 'DEAL';
+    const specs = parseSpecs(r.specs);
+    // Seller-controlled payment availability for this product (defaults to allowed
+    // when not explicitly set to false, matching the seller-side AddProduct default).
+    const shipCod    = specs.ship_cod    !== false;
+    const shipOnline = specs.ship_online !== false;
     // Resolve best available retail and deal prices:
     // locked_price in cart may be 0 if campaign prices weren't on product table at completion time.
     // Fall back to campaign.hold_price (most recent campaign with a price) or product.hold_price.
@@ -113,6 +125,8 @@ export const getCart = async (customerId) => {
       stock:         r.stock,
       category:      r.category,
       subtotal:      effectivePrice * r.quantity,
+      shipCod,
+      shipOnline,
     };
   });
 };

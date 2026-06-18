@@ -12,15 +12,23 @@ const CF_BASE_URL = 'https://sandbox.cashfree.com/pg';
 export const createOrder = async ({ amount, currency = 'INR', receipt, customerInfo = {} }) => {
   const orderId = receipt || 'hk_' + Date.now();
 
+  // Cashfree requires order_amount as a NUMBER (not string).
+  // toFixed(2) returns a string like "149.00", so we parse it back to float.
+  const orderAmount = parseFloat(Number(amount).toFixed(2));
+
+  // Cashfree requires customer_id to be at least 3 characters.
+  const rawCustomerId = customerInfo.customerId || 'cust_' + Date.now();
+  const customerId = rawCustomerId.length < 3 ? 'hk_' + rawCustomerId : rawCustomerId;
+
   const body = {
     order_id:       orderId,
-    order_amount:   Number(amount).toFixed(2),
+    order_amount:   orderAmount,
     order_currency: currency,
     customer_details: {
-      customer_id:    customerInfo.customerId || 'cust_' + Date.now(),
-      customer_email: customerInfo.email      || 'customer@holdkart.com',
-      customer_phone: customerInfo.phone      || '9999999999',
-      customer_name:  customerInfo.name       || 'HoldKart Customer',
+      customer_id:    customerId,
+      customer_email: customerInfo.email || 'customer@holdkart.com',
+      customer_phone: customerInfo.phone || '9999999999',
+      customer_name:  customerInfo.name  || 'HoldKart Customer',
     },
     order_meta: {
       return_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/orders?order_id={order_id}`,
@@ -31,9 +39,9 @@ export const createOrder = async ({ amount, currency = 'INR', receipt, customerI
   const response = await fetch(`${CF_BASE_URL}/orders`, {
     method:  'POST',
     headers: {
-      'Content-Type':   'application/json',
-      'x-api-version':  '2023-08-01',
-      'x-client-id':    CASHFREE_APP_ID,
+      'Content-Type':    'application/json',
+      'x-api-version':   '2023-08-01',
+      'x-client-id':     CASHFREE_APP_ID,
       'x-client-secret': CASHFREE_SECRET_KEY,
     },
     body: JSON.stringify(body),
@@ -99,7 +107,7 @@ export const verifyWebhookSignature = ({ rawBody, signature, timestamp }) => {
  */
 export const initiateRefund = async ({ cashfreeOrderId, refundId, amount, note = 'Order cancelled by customer' }) => {
   const body = {
-    refund_amount: Number(amount).toFixed(2),
+    refund_amount: parseFloat(Number(amount).toFixed(2)),
     refund_id:     refundId,
     refund_note:   note,
   };

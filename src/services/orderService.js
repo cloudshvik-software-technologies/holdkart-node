@@ -167,19 +167,36 @@ export const placeOrder = async ({
       await db.query(`ALTER TABLE orders ADD COLUMN sub_order_number VARCHAR(60) DEFAULT NULL`);
     } catch {}
 
+    // BUG FIX: persist the courier the customer actually picked at checkout.
+    // Previously the courier selected in the UI (Checkout.jsx / BuyNow.jsx)
+    // was only used to calculate the delivery charge and was then thrown
+    // away — it never reached the database, so the seller's Delivery
+    // Management page had no way to show it. Add the columns (safe to call
+    // multiple times) so we can store it on the order row.
+    try {
+      await db.query(`ALTER TABLE orders
+        ADD COLUMN customer_courier_id INT DEFAULT NULL,
+        ADD COLUMN customer_courier_name VARCHAR(255) DEFAULT NULL`);
+    } catch {}
+
     const [r] = await db.query(
       `INSERT INTO orders (order_number, sub_order_number, product_id, seller_id, customer_id, quantity, order_amount,
         order_status, order_date, payment_status, delivery_status, address, category,
         product_name, customer_name, created_date, payment_method, customer_email, customer_phone,
-        city, pincode, state, delivery_charge, platform_fee, payment_handling_fee, protect_promise_fee)
-       VALUES (?,?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?)`,
+        city, pincode, state, delivery_charge, platform_fee, payment_handling_fee, protect_promise_fee,
+        customer_courier_id, customer_courier_name)
+       VALUES (?,?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?,?,?)`,
       [orderNumber, subOrderNumber, p.id, p.seller_id, customerId, item.quantity, amount,
        paymentMethod === 'Online' ? 'Paid' : 'Pending',
        'Pending', address, p.category, p.product_name,
        customer?.name || '', paymentMethod,
        customer?.email || '', customer?.mobile || '', city, pincode, state,
        Number(itemDeliveryCharge) || 0, Number(platformFee) || 0,
-       Number(paymentHandlingFee) || 0, Number(protectPromiseFee) || 0]
+       Number(paymentHandlingFee) || 0, Number(protectPromiseFee) || 0,
+       // BUG FIX: store what the customer selected at checkout (Checkout.jsx /
+       // BuyNow.jsx now send these on each item) so the seller can see it.
+       item.courierId   != null ? Number(item.courierId) : null,
+       item.courierName || null]
     );
 
     await db.query('UPDATE product SET stock_quantity = stock_quantity - ? WHERE id = ?', [item.quantity, p.id]);
