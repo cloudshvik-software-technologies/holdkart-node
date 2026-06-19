@@ -13,5 +13,8 @@ r.get('/get',           c.getProfile);
 r.put('/update',        c.updateProfile);
 r.post('/upload-image', uploadProfileImg, c.uploadProfileImage);
 r.delete('/delete-image', c.deleteProfileImage);
+r.get('/deactivation-check', c.getDeactivationWarnings);
+r.post('/deactivate',    c.deactivateAccount);
+r.post('/reactivate',    c.reactivateAccount);
 
 export default r;
