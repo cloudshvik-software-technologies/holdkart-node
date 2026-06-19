@@ -1,8 +1,12 @@
 import db from '../config/db.js';
+import { sendDealJoinedEmail, sendDealTargetReachedEmail } from '../config/email.js';
+import * as txSvc from './transactionService.js';
 
 export const listCampaigns = async () => {
   const [rows] = await db.query(
-    `SELECT c.*, p.product_name, p.image_url, p.retail_price, p.hold_price, p.description,
+    `SELECT c.*, p.product_name, p.image_url, p.description, p.category,
+            COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
+            COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price,
             s.business_name AS sellerName,
             ROUND((c.current_hold / c.target) * 100) AS progressPct
      FROM campaign c
@@ -83,30 +87,95 @@ export const leaveCampaign = async ({ customerId, campaignId }) => {
 };
 
 /**
- * getMyCampaigns — returns ACTIVE and PAUSED campaigns the customer has joined
- * where the product is still active (not deleted by seller).
+ * getMyCampaigns — returns ACTIVE, PAUSED, and CANCELLED campaigns the customer has joined.
  * PAUSED campaigns are included so customers who already joined can still view their product.
+ * CANCELLED campaigns include: seller-cancelled deals (via campaign_hold) AND
+ *   deals the customer manually removed from cart (via customer_cancelled_deal table).
  */
 export const getMyCampaigns = async (customerId) => {
   await _cancelCampaignsForDeletedProducts(customerId);
 
-  const [rows] = await db.query(
+  // Ensure the customer_cancelled_deal tracking table exists
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS customer_cancelled_deal (
+      id           INT AUTO_INCREMENT PRIMARY KEY,
+      customer_id  INT NOT NULL,
+      product_id   INT NOT NULL,
+      campaign_id  INT,
+      cancelled_at DATETIME NOT NULL DEFAULT NOW(),
+      INDEX idx_ccd_customer (customer_id)
+    )
+  `);
+
+  // Part 1: ACTIVE and PAUSED deals (customer still has campaign_hold rows)
+  const [activeRows] = await db.query(
     `SELECT MIN(ch.id) AS holdId, ch.campaign_id, c.id AS campaignRowId, ch.customer_id,
             ch.product_id, MIN(ch.joined_date) AS joined_date,
             c.status AS campaignStatus, c.target, c.current_hold,
             COUNT(ch.id) AS mySlots,
-            p.product_name, p.image_url, p.retail_price, p.hold_price, p.category
+            p.product_name, p.image_url, p.category,
+            COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
+            COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price
      FROM campaign_hold ch
      JOIN campaign c ON c.id = ch.campaign_id
-     JOIN product p ON p.id = ch.product_id AND p.active = 1
+     LEFT JOIN product p ON p.id = ch.product_id
      WHERE ch.customer_id = ? AND c.status IN ('ACTIVE', 'PAUSED')
      GROUP BY ch.campaign_id, c.id, ch.customer_id, ch.product_id,
               c.status, c.target, c.current_hold,
-              p.product_name, p.image_url, p.retail_price, p.hold_price, p.category
-     ORDER BY joined_date DESC`,
+              p.product_name, p.image_url, p.category,
+              c.retail_price, c.hold_price, p.retail_price, p.hold_price`,
     [customerId]
   );
-  return rows;
+
+  // Part 2: Seller-cancelled deals (campaign status = CANCELLED, hold rows may still exist)
+  const [sellerCancelledRows] = await db.query(
+    `SELECT MIN(ch.id) AS holdId, ch.campaign_id, c.id AS campaignRowId, ch.customer_id,
+            ch.product_id, MIN(ch.joined_date) AS joined_date,
+            'CANCELLED' AS campaignStatus, c.target, c.current_hold,
+            COUNT(ch.id) AS mySlots,
+            p.product_name, p.image_url, p.category,
+            COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
+            COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price
+     FROM campaign_hold ch
+     JOIN campaign c ON c.id = ch.campaign_id
+     LEFT JOIN product p ON p.id = ch.product_id
+     WHERE ch.customer_id = ? AND c.status = 'CANCELLED'
+     GROUP BY ch.campaign_id, c.id, ch.customer_id, ch.product_id,
+              c.target, c.current_hold,
+              p.product_name, p.image_url, p.category,
+              c.retail_price, c.hold_price, p.retail_price, p.hold_price`,
+    [customerId]
+  );
+
+  // Part 3: Customer-cancelled deals (removed DEAL item from cart after deal completed)
+  const [customerCancelledRows] = await db.query(
+    `SELECT ccd.id AS holdId, ccd.campaign_id, ccd.campaign_id AS campaignRowId, ccd.customer_id,
+            ccd.product_id, ccd.cancelled_at AS joined_date,
+            'CANCELLED' AS campaignStatus,
+            COALESCE(c.target, 0) AS target, COALESCE(c.current_hold, 0) AS current_hold,
+            1 AS mySlots,
+            p.product_name, p.image_url, p.category,
+            COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
+            COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price
+     FROM customer_cancelled_deal ccd
+     LEFT JOIN campaign c ON c.id = ccd.campaign_id
+     LEFT JOIN product p ON p.id = ccd.product_id
+     WHERE ccd.customer_id = ?`,
+    [customerId]
+  );
+
+  // Merge all, deduplicate by product_id (prefer active/paused over cancelled)
+  const seen = new Set();
+  const result = [];
+  for (const row of [...activeRows, ...sellerCancelledRows, ...customerCancelledRows]) {
+    const key = String(row.product_id);
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(row);
+    }
+  }
+
+  return result.sort((a, b) => new Date(b.joined_date) - new Date(a.joined_date));
 };
 
 /**
@@ -127,7 +196,9 @@ export const getProductCampaignStatus = async (productId) => {
 
 export const getCampaignById = async (campaignId) => {
   const [rows] = await db.query(
-    `SELECT c.*, p.product_name, p.image_url, p.retail_price, p.hold_price, p.description,
+    `SELECT c.*, p.product_name, p.image_url, p.description,
+            COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
+            COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price,
             s.business_name AS sellerName,
             ROUND((c.current_hold / c.target) * 100) AS progressPct
      FROM campaign c
@@ -140,7 +211,7 @@ export const getCampaignById = async (campaignId) => {
   return rows[0];
 };
 
-export const startOrJoinCampaign = async ({ customerId, productId, quantity = 1 }) => {
+export const startOrJoinCampaign = async ({ customerId, productId, quantity = 1, cashfreeOrderId = null, depositAmount = null }) => {
   quantity = Math.max(1, parseInt(quantity, 10) || 1);
 
   const [products] = await db.query(
@@ -150,12 +221,7 @@ export const startOrJoinCampaign = async ({ customerId, productId, quantity = 1 
   if (!products.length) { const e = new Error('Product not found or no longer available'); e.status = 404; throw e; }
   const product = products[0];
 
-  if (!product.hold_target || product.hold_target <= 0) {
-    const e = new Error('This product does not support group deals');
-    e.status = 400;
-    throw e;
-  }
-
+  // Check for an existing active campaign first (seller may have set target via campaign portal)
   let [campaigns] = await db.query(
     "SELECT * FROM campaign WHERE product_id = ? AND status = 'ACTIVE' AND (end_time IS NULL OR end_time > NOW()) LIMIT 1",
     [productId]
@@ -163,11 +229,19 @@ export const startOrJoinCampaign = async ({ customerId, productId, quantity = 1 
 
   let campaign = campaigns[0];
 
+  // Product supports group deals if it has hold_target set OR already has an active campaign
+  const effectiveTarget = (campaign && campaign.target > 0) ? campaign.target : product.hold_target;
+  if (!effectiveTarget || effectiveTarget <= 0) {
+    const e = new Error('This product does not support group deals');
+    e.status = 400;
+    throw e;
+  }
+
   if (!campaign) {
     const [result] = await db.query(
       `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time)
        VALUES (?, ?, ?, 0, 'ACTIVE', NOW())`,
-      [productId, product.seller_id, product.hold_target]
+      [productId, product.seller_id, effectiveTarget]
     );
     const [newCampaign] = await db.query('SELECT * FROM campaign WHERE id = ?', [result.insertId]);
     campaign = newCampaign[0];
@@ -201,13 +275,63 @@ export const startOrJoinCampaign = async ({ customerId, productId, quantity = 1 
     await _completeCampaignAndReset(updated[0]);
   }
 
+  // Record deposit transaction using actual payment info from frontend
+  try {
+    const [priceRows] = await db.query(
+      'SELECT retail_price, hold_price, product_name FROM product WHERE id = ?',
+      [productId]
+    );
+    if (priceRows.length) {
+      const retailPrice    = Number(priceRows[0].retail_price);
+      const holdPrice      = Number(priceRows[0].hold_price);
+      const productName    = priceRows[0].product_name;
+      const depositPerUnit = Math.max(0, retailPrice - holdPrice);
+      // Use actual amount paid from frontend; fall back to calculated deposit
+      const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+      if (totalDeposit > 0) {
+        await txSvc.record({
+          customerId,
+          orderId:         null,
+          orderNumber:     null,
+          amount:          totalDeposit,
+          type:            'DEAL_DEPOSIT',
+          method:          'Online',
+          status:          'SUCCESS',
+          description:     `Deal deposit for "${productName}" x${quantity} (Campaign #${campaign.id})`,
+          cashfreeOrderId: cashfreeOrderId,
+        });
+      }
+    }
+  } catch (txErr) {
+    console.error('[campaignService] transaction record error:', txErr.message);
+  }
+
+  // Send deal joined email
+  try {
+    const [crows] = await db.query('SELECT name, email FROM customer WHERE id = ?', [customerId]);
+    if (crows.length && crows[0].email) {
+      const [prRows] = await db.query('SELECT product_name, hold_price, retail_price FROM product WHERE id = ?', [productId]);
+      await sendDealJoinedEmail(crows[0].email, {
+        name:          crows[0].name,
+        productName:   prRows[0]?.product_name || 'Product',
+        quantity,
+        depositAmount,
+        campaignId:    campaign.id,
+        holdPrice:     prRows[0]?.hold_price   || null,
+        retailPrice:   prRows[0]?.retail_price || null,
+      });
+    }
+  } catch (emailErr) {
+    console.error('[campaignService] join deal email error:', emailErr.message);
+  }
+
   return { message: 'You have joined the group deal!', campaignId: campaign.id };
 };
 
 /**
  * addToDeal — called when an already-joined customer adds more units.
  */
-export const addToDeal = async ({ customerId, productId, quantity = 1 }) => {
+export const addToDeal = async ({ customerId, productId, quantity = 1, cashfreeOrderId = null, depositAmount = null }) => {
   quantity = Math.max(1, parseInt(quantity, 10) || 1);
 
   const [campaigns] = await db.query(
@@ -238,6 +362,36 @@ export const addToDeal = async ({ customerId, productId, quantity = 1 }) => {
   const dealCompleted = !!(updated[0] && updated[0].current_hold >= updated[0].target);
   if (dealCompleted) {
     await _completeCampaignAndReset(updated[0]);
+  }
+
+  // Record deposit transaction for the added slots
+  try {
+    const [priceRows] = await db.query(
+      'SELECT retail_price, hold_price, product_name FROM product WHERE id = ?',
+      [productId]
+    );
+    if (priceRows.length) {
+      const retailPrice    = Number(priceRows[0].retail_price);
+      const holdPrice      = Number(priceRows[0].hold_price);
+      const productName    = priceRows[0].product_name;
+      const depositPerUnit = Math.max(0, retailPrice - holdPrice);
+      const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+      if (totalDeposit > 0) {
+        await txSvc.record({
+          customerId,
+          orderId:         null,
+          orderNumber:     null,
+          amount:          totalDeposit,
+          type:            'DEAL_DEPOSIT',
+          method:          'Online',
+          status:          'SUCCESS',
+          description:     `Deal deposit for "${productName}" x${quantity} (Campaign #${campaign.id})`,
+          cashfreeOrderId: cashfreeOrderId,
+        });
+      }
+    }
+  } catch (txErr) {
+    console.error('[campaignService] addToDeal transaction error:', txErr.message);
   }
 
   return { message: 'Slot added to deal!', campaignId: campaign.id, dealCompleted };
@@ -322,10 +476,10 @@ async function _completeCampaignAndReset(campaign) {
   );
 
   const [priceRows] = await db.query('SELECT retail_price, hold_price, product_name FROM product WHERE id = ?', [campaign.product_id]);
-  const lockedPrice   = priceRows[0]?.hold_price   ?? null;
-  const retailPrice   = priceRows[0]?.retail_price  ?? null;
   const productName   = priceRows[0]?.product_name || 'the product';
-
+  // Prefer campaign-level prices (set via seller portal) over product-level prices
+  const lockedPrice = (Number(campaign.hold_price) > 0 ? Number(campaign.hold_price) : null) ?? (Number(priceRows[0]?.hold_price) || null);
+  const retailPrice = (Number(campaign.retail_price) > 0 ? Number(campaign.retail_price) : null) ?? (Number(priceRows[0]?.retail_price) || null);
   // depositPerUnit = what each customer paid upfront when joining = retailPrice - holdPrice
   const depositPerUnit = (retailPrice !== null && lockedPrice !== null)
     ? Math.max(0, Number(retailPrice) - Number(lockedPrice))
@@ -370,6 +524,22 @@ async function _completeCampaignAndReset(campaign) {
         'CAMPAIGN',
       ]
     );
+
+    // Send deal target reached email
+    try {
+      const [crows] = await db.query('SELECT email FROM customer WHERE id = ?', [h.customer_id]);
+      if (crows.length && crows[0].email) {
+        const [cnameRows] = await db.query('SELECT name FROM customer WHERE id = ?', [h.customer_id]);
+        await sendDealTargetReachedEmail(crows[0].email, {
+          name:        cnameRows[0]?.name || 'Customer',
+          productName,
+          holdPrice:   lockedPrice,
+          quantity:    slotCount,
+        });
+      }
+    } catch (emailErr) {
+      console.error('[campaignService] deal target email error:', emailErr.message);
+    }
   }
 
   await db.query('DELETE FROM campaign_hold WHERE campaign_id = ?', [campaign.id]);
@@ -379,10 +549,16 @@ async function _completeCampaignAndReset(campaign) {
     [campaign.product_id]
   );
   if (stockRows.length && stockRows[0].stock_quantity > 0) {
-    await db.query(
-      `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time)
-       VALUES (?, ?, ?, 0, 'ACTIVE', NOW())`,
-      [campaign.product_id, stockRows[0].seller_id, stockRows[0].hold_target]
-    );
+    // Use campaign's own target/prices (set via seller portal); fall back to product table
+    const newTarget      = (campaign.target > 0 ? campaign.target : stockRows[0].hold_target) || 0;
+    const newHoldPrice   = campaign.hold_price   || null;
+    const newRetailPrice = campaign.retail_price || null;
+    if (newTarget > 0) {
+      await db.query(
+        `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time, hold_price, retail_price)
+         VALUES (?, ?, ?, 0, 'ACTIVE', NOW(), ?, ?)`,
+        [campaign.product_id, stockRows[0].seller_id, newTarget, newHoldPrice, newRetailPrice]
+      );
+    }
   }
 }

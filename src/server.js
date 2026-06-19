@@ -1,6 +1,7 @@
 import 'dotenv/config';
   import app from './app.js';
   import db from './config/db.js';
+  import { startInvoiceEmailPoller } from './services/orderService.js';
 
   const PORT = process.env.PORT || 8081;
 
@@ -24,6 +25,6 @@ import 'dotenv/config';
     app.listen(PORT, () => {
       console.log(`Server Connected on PORT ${PORT}`);
       // console.log(`    API prefix: /api/customer`);
+      startInvoiceEmailPoller();
     });
   })();
-  

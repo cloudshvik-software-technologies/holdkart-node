@@ -3,4 +3,9 @@ node_modules/
   uploads/
   holdkart-node/.env
   holdkart-node/node_modules/.env
+  node_modules/
   
+*.log
+dist/
+build/
+coverage/

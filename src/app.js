@@ -7,17 +7,19 @@ import fs from 'fs';
 import http from 'http';
 import https from 'https';
 
-import authRoutes         from './routes/auth.js';
-import productRoutes      from './routes/product.js';
-import cartRoutes         from './routes/cart.js';
-import wishlistRoutes     from './routes/wishlist.js';
-import orderRoutes        from './routes/orders.js';
-import profileRoutes      from './routes/profile.js';
-import notificationRoutes from './routes/notifications.js';
-import complaintRoutes    from './routes/complaints.js';
-import reviewRoutes       from './routes/review.js';
-import campaignRoutes     from './routes/campaign.js';
-import paymentRoutes      from './routes/payment.js';
+import authRoutes            from './routes/auth.js';
+import productRoutes         from './routes/product.js';
+import cartRoutes            from './routes/cart.js';
+import wishlistRoutes        from './routes/wishlist.js';
+import orderRoutes           from './routes/orders.js';
+import profileRoutes         from './routes/profile.js';
+import notificationRoutes    from './routes/notifications.js';
+import complaintRoutes       from './routes/complaints.js';
+import reviewRoutes          from './routes/review.js';
+import campaignRoutes        from './routes/campaign.js';
+import paymentRoutes         from './routes/payment.js';
+import advertisementRoutes   from './routes/advertisement.js';
+import shippingRoutes        from './routes/shipping.js';
 import { notFound, errorHandler } from './middleware/errorHandler.js';
 import env from './config/env.js';
 
@@ -96,6 +98,8 @@ app.use('/api/customer/complaints',    complaintRoutes);
 app.use('/api/customer/review',        reviewRoutes);
 app.use('/api/customer/campaign',      campaignRoutes);
 app.use('/api/customer/payment',       paymentRoutes);
+app.use('/api/customer/ads',           advertisementRoutes);
+app.use('/api/customer/shipping',      shippingRoutes);
 
 app.get('/health', (_req, res) => res.json({ status: 'OK', service: 'holdkart-customer-backend' }));
 
