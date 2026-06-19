@@ -6,6 +6,23 @@ import { sendOrderPlacedEmail, sendInvoiceEmail, sendOrderShippedEmail, sendOrde
 
 const genOrderNumber = () => 'HK' + Date.now();
 
+// The seller dashboard's Notifications page reads from `seller_notification`,
+// but nothing in the order flow was ever writing to it — so sellers never
+// saw Order/Payment alerts there, even though orders/payments were
+// happening. Centralize the insert here and call it at the key order events.
+const notifySeller = async (sellerId, title, message) => {
+  if (!sellerId) return;
+  try {
+    await db.query(
+      `INSERT INTO seller_notification (seller_id, title, message, created_date, read_status)
+       VALUES (?, ?, ?, NOW(), 0)`,
+      [sellerId, title, message]
+    );
+  } catch (e) {
+    console.error('[orderService] seller notification error:', e.message);
+  }
+};
+
 // Ensure the tracking columns exist (safe to call multiple times)
 const ensureEmailTrackingColumns = async () => {
   try {
@@ -221,6 +238,20 @@ export const placeOrder = async ({
       'INSERT INTO customer_notification (customer_id, title, message, type) VALUES (?,?,?,?)',
       [customerId, 'Order Placed!', `Your order ${orderNumber} for ${p.product_name} has been placed.`, 'ORDER']
     );
+
+    // Notify the seller of the new order, and of the payment if it was paid online.
+    await notifySeller(
+      p.seller_id,
+      'New Order Received',
+      `You have a new order ${subOrderNumber} for "${p.product_name}" (Qty: ${item.quantity}). Amount: ₹${amount}.`
+    );
+    if (paymentMethod === 'Online') {
+      await notifySeller(
+        p.seller_id,
+        'Payment Received',
+        `Online payment of ₹${amount} received for "${p.product_name}" (Ref: ${subOrderNumber}).`
+      );
+    }
 
     // Send order placed + invoice email
     try {
@@ -554,6 +585,12 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
         ]
       );
 
+      await notifySeller(
+        order.seller_id,
+        'Order Cancelled — Refund Initiated',
+        `Order ${order.order_number} for "${order.product_name}" was cancelled by the customer. ₹${order.order_amount} refund has been initiated.`
+      );
+
       return { message: 'Order cancelled and refund initiated successfully' };
 
     } else {
@@ -586,6 +623,12 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
         ]
       );
 
+      await notifySeller(
+        order.seller_id,
+        'Order Cancelled',
+        `Order ${order.order_number} for "${order.product_name}" was cancelled by the customer.`
+      );
+
       return { message: 'Order cancelled successfully' };
     }
   }
@@ -603,16 +646,23 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
     }
   }
 
+  // COD orders never have money collected up front, so a Shipped-stage COD
+  // cancellation must never be recorded as a "Refund" request — there is
+  // nothing to refund. Store it as a plain "Cancellation" resolution so it
+  // does not show up in the seller's Refund Manager (which only lists
+  // resolution_type = 'Refund' requests).
+  const storedResType = (resType === 'Refund' && !isOnline) ? 'Cancellation' : resType;
+
   await db.query(
     "UPDATE orders SET order_status = 'Cancellation Requested', cancellation_reason = ?, resolution_type = ? WHERE id = ?",
-    [cancellation_reason || null, resType, orderId]
+    [cancellation_reason || null, storedResType, orderId]
   );
 
   await db.query(
     `INSERT INTO order_cancel_request
        (order_id, customer_id, seller_id, cancellation_reason, resolution_type, status, created_at)
      VALUES (?, ?, ?, ?, ?, 'Pending', NOW())`,
-    [orderId, customerId, order.seller_id, cancellation_reason || null, resType]
+    [orderId, customerId, order.seller_id, cancellation_reason || null, storedResType]
   );
 
   // Cancel on Shiprocket if we have the order ID
@@ -702,7 +752,16 @@ export const returnOrder = async ({ orderId, customerId, cancellation_reason, re
     const e = new Error('Return requests are only allowed for delivered orders'); e.status = 400; throw e;
   }
 
-  const resType = ['Refund', 'Replace'].includes(resolution_type) ? resolution_type : 'Refund';
+  const isOnline = (order.payment_method || '').toUpperCase() === 'ONLINE';
+  let resType = ['Refund', 'Replace'].includes(resolution_type) ? resolution_type : 'Refund';
+
+  // COD orders never had money collected up front, so a "Refund" resolution
+  // is not valid for them — fall back to "Replace" (or block entirely if a
+  // replacement was already used) so no refund request is ever created for
+  // a COD order.
+  if (resType === 'Refund' && !isOnline) {
+    resType = 'Replace';
+  }
 
   if (resType === 'Replace') {
     const [existing] = await db.query(
