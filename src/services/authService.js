@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import db from '../config/db.js';
 import { sendEmail, sendPasswordResetEmail, sendWelcomeEmail, sendPasswordChangedEmail } from '../config/email.js';
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../config/jwt.js';
+import { anonymizeCustomerIfExpired } from './profileService.js';
 
 const BCRYPT_ROUNDS = 10;
 const REFRESH_TTL_DAYS = 7;
@@ -66,6 +67,27 @@ export const login = async ({ email, password }) => {
   const activeVal = customer.active ?? 1;
   if (!activeVal) { const e = new Error('Account suspended. Contact support.'); e.status = 403; throw e; }
 
+  // PERMANENT DELETION CHECK (lazy — runs the moment an expired account
+  // next tries to log in). If 30+ days have passed since deactivation,
+  // the account's PII is scrubbed for good and login is refused.
+  // NOTE: this only fires on a login attempt; an account that's never
+  // logged into again stays deactivated-but-recoverable indefinitely in
+  // the DB. For guaranteed same-day expiry regardless of login activity,
+  // pair this with a scheduled job calling the same helper.
+  const wasAnonymized = await anonymizeCustomerIfExpired(customer);
+  if (wasAnonymized) {
+    const e = new Error('This account has been permanently deleted.');
+    e.status = 410;
+    throw e;
+  }
+
+  // DEACTIVATED BUT STILL RECOVERABLE: do NOT auto-reactivate on login.
+  // The customer must explicitly press "Activate My Account" on the
+  // locked screen (see profileService.reactivateAccount). We still issue
+  // tokens here so the frontend can call that authenticated endpoint.
+  const deactivated   = !!customer.deactivated_at;
+  const deactivatedAt = customer.deactivated_at || null;
+
   const accessToken  = signAccessToken(buildPayload(customer));
   const refreshToken = signRefreshToken({ id: customer.id });
   const expiresAt    = new Date(Date.now() + REFRESH_TTL_DAYS * 86400000);
@@ -86,6 +108,8 @@ export const login = async ({ email, password }) => {
       email: customer.email,
       mobile: customer.mobile || null,
       profileImage: customer.profile_image || null,
+      deactivated: deactivated,
+      deactivatedAt: deactivatedAt,
     },
   };
 };

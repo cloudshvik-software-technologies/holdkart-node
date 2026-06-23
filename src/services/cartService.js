@@ -36,7 +36,7 @@ export const addToCart = async ({ customerId, productId, quantity = 1 }) => {
   const remainingStock = Math.max(0, stock_quantity - current_hold);
 
   if (remainingStock <= 0) {
-    const e = new Error('No stock available \u2014 all units are reserved for the active campaign');
+    const e = new Error('No stock available — all units are reserved for the active campaign');
     e.status = 400;
     throw e;
   }
@@ -186,4 +186,37 @@ export const removeFromCart = async ({ customerId, cartId }) => {
 export const clearCart = async (customerId) => {
   await db.query('DELETE FROM cart WHERE customer_id = ?', [customerId]);
   return { message: 'Cart cleared' };
+};
+
+/**
+ * mergeCart — called right after login to merge guest cart items into the
+ * customer's server-side cart.
+ *
+ * Strategy: for each guest item, attempt addToCart (which respects stock /
+ * campaign rules). Items that fail (no active campaign, out of stock, etc.)
+ * are silently skipped so that valid items still get merged.
+ *
+ * @param {number} customerId
+ * @param {Array<{ productId: number|string, quantity: number }>} items
+ * @returns {{ merged: number, skipped: number }}
+ */
+export const mergeCart = async (customerId, items = []) => {
+  let merged = 0;
+  let skipped = 0;
+
+  for (const item of items) {
+    try {
+      await addToCart({
+        customerId,
+        productId: Number(item.productId),
+        quantity: Number(item.quantity) || 1,
+      });
+      merged++;
+    } catch {
+      // Product not available / out of stock — skip silently
+      skipped++;
+    }
+  }
+
+  return { merged, skipped };
 };

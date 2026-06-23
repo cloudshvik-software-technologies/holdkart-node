@@ -47,6 +47,40 @@ export const deleteProfileImage = async (req, res) => {
     res.status(500).json({ message: e.message });
   }
 };
+// Pending orders / active deals shown to the customer before they confirm deactivation.
+export const getDeactivationWarnings = async (req, res) => {
+  try {
+    res.json(await svc.getDeactivationWarnings(req.customer.id));
+  } catch (e) {
+    console.error('[profileController.getDeactivationWarnings] ERROR:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+};
+
+// FLIPKART-STYLE DEACTIVATION: customer confirms with password; account is
+// soft-deactivated (not deleted). Logging back in shows a locked screen
+// with an explicit "Activate" button (see reactivateAccount below).
+export const deactivateAccount = async (req, res) => {
+  try {
+    res.json(await svc.deactivateAccount({
+      customerId: req.customer.id,
+      password:   req.body.password,
+    }));
+  } catch (e) {
+    console.error('[profileController.deactivateAccount] ERROR:', e.message);
+    res.status(e.status || 500).json({ message: e.message });
+  }
+};
+
+export const reactivateAccount = async (req, res) => {
+  try {
+    res.json(await svc.reactivateAccount({ customerId: req.customer.id }));
+  } catch (e) {
+    console.error('[profileController.reactivateAccount] ERROR:', e.message);
+    res.status(e.status || 500).json({ message: e.message });
+  }
+};
+
 export const debugProfile = async (_req, res) => {
   const results = {};
   try {
