@@ -23,8 +23,14 @@ export const register = async ({ name, email, mobile, password }) => {
   const [exist] = await db.query('SELECT id FROM customer WHERE email = ?', [email]);
   if (exist.length) { const e = new Error('Email already registered.'); e.status = 409; throw e; }
 
-  const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
   const cols = await getCustomerCols();
+
+  if (cols.has('mobile') && mobile) {
+    const [mobileExist] = await db.query('SELECT id FROM customer WHERE mobile = ?', [mobile]);
+    if (mobileExist.length) { const e = new Error('Mobile number already registered.'); e.status = 409; throw e; }
+  }
+
+  const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
   /* Build INSERT dynamically based on what columns actually exist */
   const fields = ['name', 'email', 'password'];

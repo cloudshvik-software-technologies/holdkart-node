@@ -47,6 +47,17 @@ export const deleteProfileImage = async (req, res) => {
     res.status(500).json({ message: e.message });
   }
 };
+// Returns pending orders, active deals, and account status for the 3-step
+// deactivation modal (step 2 — account info review).
+export const getDeactivationInfo = async (req, res) => {
+  try {
+    res.json(await svc.getDeactivationInfo(req.customer.id));
+  } catch (e) {
+    console.error('[profileController.getDeactivationInfo] ERROR:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+};
+
 // Pending orders / active deals shown to the customer before they confirm deactivation.
 export const getDeactivationWarnings = async (req, res) => {
   try {
@@ -65,6 +76,7 @@ export const deactivateAccount = async (req, res) => {
     res.json(await svc.deactivateAccount({
       customerId: req.customer.id,
       password:   req.body.password,
+      reason:     req.body.reason || '',
     }));
   } catch (e) {
     console.error('[profileController.deactivateAccount] ERROR:', e.message);
