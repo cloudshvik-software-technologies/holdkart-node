@@ -17,15 +17,20 @@ const toProduct = (p) => {
   const currentHold    = Number(p.current_hold) || 0;
   const stock          = Number(p.stock_quantity) || 0;
   const remainingStock = Math.max(0, stock - currentHold);
+  const hasCampaign    = Number(p.has_campaign) === 1;
   return {
     productId: p.id, sellerId: p.seller_id, sellerName: p.seller_name || null,
     name: p.product_name, description: p.description, category: p.category,
     imageUrl: images[0] || null, images,
     retailPrice: Number(p.campaign_retail_price) || p.retail_price,
-    holdPrice:   Number(p.campaign_hold_price)   || p.hold_price,
-    holdTarget:  Number(p.campaign_hold_target)  || p.hold_target,
+    // Only expose group-deal pricing/target when the product actually has an ACTIVE campaign.
+    // Without this gate, products fall back to their static product.hold_price/hold_target
+    // (set by the seller at creation time) and would incorrectly show the "Join Deal" button
+    // even when no campaign is running.
+    holdPrice:   hasCampaign ? (Number(p.campaign_hold_price)  || p.hold_price) : null,
+    holdTarget:  hasCampaign ? (Number(p.campaign_hold_target) || p.hold_target) : 0,
     currentHold,
-    hasCampaign: Number(p.has_campaign) === 1,
+    hasCampaign,
     stock, remainingStock, active: Boolean(p.active),
     warehouseLocation: p.warehouse_location,
     avgRating: Number(p.avg_rating) || 0, reviewCount: Number(p.review_count) || 0,
@@ -48,10 +53,7 @@ const PRODUCT_SELECT = `SELECT p.*,
   (SELECT c4.target       FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' AND c4.target > 0 LIMIT 1) AS campaign_hold_target,
   (SELECT c4.retail_price FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' LIMIT 1) AS campaign_retail_price
   FROM product p LEFT JOIN review r ON r.product_id = p.id
-  WHERE p.active = 1 AND p.stock_quantity > 0
-  AND EXISTS (
-    SELECT 1 FROM campaign c2 WHERE c2.product_id = p.id AND c2.status = 'ACTIVE' AND c2.target > 0
-  )`;
+  WHERE p.active = 1 AND p.stock_quantity > 0`;
 
 export const listProducts = async ({ search, category, minPrice, maxPrice, rating, page = 1, limit = 20 }) => {
   let sql = PRODUCT_SELECT;
@@ -89,9 +91,6 @@ export const getProduct = async (productId) => {
      LEFT JOIN seller s ON s.id = p.seller_id
      LEFT JOIN review r ON r.product_id = p.id
      WHERE p.id = ? AND p.active = 1
-     AND EXISTS (
-       SELECT 1 FROM campaign c2 WHERE c2.product_id = p.id AND c2.status = 'ACTIVE' AND c2.target > 0
-     )
      GROUP BY p.id`,
     [productId]
   );
@@ -382,17 +381,23 @@ export const getPersonalizedSuggested = async (customerId, limit = 14) => {
 export const getGuestSectionProducts = async (sectionType, limit = 14) => {
   try {
     let orderBy;
+    let extraWhere = '';
     if (sectionType === 'trending') {
       orderBy = 'current_hold DESC, p.id DESC';
     } else if (sectionType === 'deals') {
       orderBy = 'campaign_hold_target DESC, avg_rating DESC, p.id DESC';
+      // This section is specifically meant to showcase running group deals,
+      // so (unlike general listings) it still requires an active campaign.
+      extraWhere = ` AND EXISTS (
+        SELECT 1 FROM campaign c2 WHERE c2.product_id = p.id AND c2.status = 'ACTIVE' AND c2.target > 0
+      )`;
     } else {
       // top_rated (default)
       orderBy = 'avg_rating DESC, review_count DESC, p.id DESC';
     }
 
     const [rows] = await db.query(
-      `${PRODUCT_SELECT} GROUP BY p.id ORDER BY ${orderBy} LIMIT ?`,
+      `${PRODUCT_SELECT}${extraWhere} GROUP BY p.id ORDER BY ${orderBy} LIMIT ?`,
       [Number(limit)]
     );
     return rows.map(toProduct);

@@ -73,14 +73,52 @@ const REACTIVATION_WINDOW_DAYS = 30;
 async function ensureDeactivationCols() {
   const cols = await getCols();
   if (!cols.has('deactivated_at')) {
-    await db.query('ALTER TABLE customer ADD COLUMN IF NOT EXISTS deactivated_at DATETIME NULL');
+    await db.query('ALTER TABLE customer ADD COLUMN deactivated_at DATETIME NULL');
     invalidateColCache();
   }
   if (!cols.has('permanently_deleted_at')) {
-    await db.query('ALTER TABLE customer ADD COLUMN IF NOT EXISTS permanently_deleted_at DATETIME NULL');
+    await db.query('ALTER TABLE customer ADD COLUMN permanently_deleted_at DATETIME NULL');
+    invalidateColCache();
+  }
+  if (!cols.has('deactivation_reason')) {
+    await db.query('ALTER TABLE customer ADD COLUMN deactivation_reason TEXT NULL');
     invalidateColCache();
   }
 }
+
+// Returns pending orders, active deals, and current account status for
+// the 3-step deactivation modal (step 2 — account info review).
+export const getDeactivationInfo = async (customerId) => {
+  await ensureDeactivationCols();
+
+  const [[orderRow]] = await db.query(
+    `SELECT COUNT(*) AS cnt FROM orders WHERE customer_id = ? AND order_status NOT IN ('Delivered', 'Cancelled')`,
+    [customerId]
+  );
+  const [[dealRow]] = await db.query(
+    `SELECT COUNT(*) AS cnt FROM campaign_hold ch
+     JOIN campaign c ON c.id = ch.campaign_id
+     WHERE ch.customer_id = ? AND c.status IN ('ACTIVE', 'PAUSED')`,
+    [customerId]
+  );
+  const [rows] = await db.query(
+    'SELECT id, deactivated_at, permanently_deleted_at FROM customer WHERE id = ?',
+    [customerId]
+  );
+  const customer = rows[0];
+
+  const deactivatedAt = customer?.deactivated_at || null;
+  const daysLeftToRecover = deactivatedAt
+    ? Math.max(0, Math.ceil(REACTIVATION_WINDOW_DAYS - (Date.now() - new Date(deactivatedAt).getTime()) / 86400000))
+    : null;
+
+  return {
+    pendingOrders:     orderRow.cnt,
+    activeDeals:       dealRow.cnt,
+    accountStatus:     deactivatedAt ? 'deactivation_pending' : 'active',
+    daysLeftToRecover,
+  };
+};
 
 // Shown to the customer in the confirmation modal BEFORE they deactivate,
 // so they know what's still in flight on their account.
@@ -105,7 +143,7 @@ export const getDeactivationWarnings = async (customerId) => {
 // is now an explicit action (see reactivateAccount below) rather than
 // automatic on next login — the deactivated customer only sees a locked
 // "Account Deactivated" screen until they press Activate.
-export const deactivateAccount = async ({ customerId, password }) => {
+export const deactivateAccount = async ({ customerId, password, reason = '' }) => {
   if (!password) { const e = new Error('Password is required to deactivate your account.'); e.status = 400; throw e; }
 
   await ensureDeactivationCols();
@@ -117,7 +155,7 @@ export const deactivateAccount = async ({ customerId, password }) => {
   const match = await bcrypt.compare(password, customer.password);
   if (!match) { const e = new Error('Incorrect password.'); e.status = 401; throw e; }
 
-  await db.query('UPDATE customer SET deactivated_at = NOW() WHERE id = ?', [customerId]);
+  await db.query('UPDATE customer SET deactivated_at = NOW(), deactivation_reason = ? WHERE id = ?', [reason || null, customerId]);
   // Log the customer out of every device, same as a normal logout would.
   await db.query('DELETE FROM customer_refresh_tokens WHERE customer_id = ?', [customerId]);
 
