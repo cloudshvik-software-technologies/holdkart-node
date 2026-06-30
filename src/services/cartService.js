@@ -13,9 +13,10 @@ const parseSpecs = (raw) => {
 };
 
 export const addToCart = async ({ customerId, productId, quantity = 1 }) => {
-  // Only allow adding to cart when an ACTIVE campaign exists for this product.
-  // The available quantity is total stock minus the slots already committed in
-  // the current active campaign (current_hold).
+  // If an ACTIVE campaign exists for this product, the available quantity is
+  // total stock minus the slots already committed in that campaign.
+  // If there is NO active campaign, the product is a fixed-price item and is
+  // purchasable directly using the product's own stock_quantity.
   const [campaignRows] = await db.query(
     `SELECT c.id, c.current_hold, p.stock_quantity
      FROM campaign c
@@ -26,14 +27,25 @@ export const addToCart = async ({ customerId, productId, quantity = 1 }) => {
     [productId]
   );
 
-  if (!campaignRows.length) {
-    const e = new Error('This product is not available for purchase right now');
-    e.status = 400;
-    throw e;
-  }
+  let remainingStock;
 
-  const { current_hold, stock_quantity } = campaignRows[0];
-  const remainingStock = Math.max(0, stock_quantity - current_hold);
+  if (campaignRows.length) {
+    const { current_hold, stock_quantity } = campaignRows[0];
+    remainingStock = Math.max(0, stock_quantity - current_hold);
+  } else {
+    const [productRows] = await db.query(
+      `SELECT stock_quantity FROM product WHERE id = ? AND active = 1 LIMIT 1`,
+      [productId]
+    );
+
+    if (!productRows.length) {
+      const e = new Error('This product is not available for purchase right now');
+      e.status = 400;
+      throw e;
+    }
+
+    remainingStock = Math.max(0, productRows[0].stock_quantity);
+  }
 
   if (remainingStock <= 0) {
     const e = new Error('No stock available — all units are reserved for the active campaign');
