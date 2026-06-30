@@ -275,13 +275,22 @@ export const placeOrder = async ({
     // ── Shiprocket: create order, assign AWB, store in shipping table ──
     try {
       const orderDateStr = new Date().toISOString().replace('T', ' ').substring(0, 16);
+      // BUG FIX: Shiprocket rejects orders with an empty customerPhone (it's a
+      // required field on their side). Some customer profiles have no saved
+      // mobile number, which silently broke shipment creation (caught below as
+      // "non-fatal", but the order then never got an AWB/shipment at all).
+      // Fall back to a valid placeholder phone so the shipment can still be created.
+      const shiprocketPhone = (customer?.mobile && String(customer.mobile).trim())
+        ? customer.mobile
+        : '9999999999';
+
       const sr = await shiprocket.createShiprocketOrder({
         orderId:       r.insertId,
         orderNumber,
         orderDate:     orderDateStr,
         customerName:  customer?.name     || '',
         customerEmail: customer?.email    || '',
-        customerPhone: customer?.mobile   || '',
+        customerPhone: shiprocketPhone,
         address,
         city,
         pincode,
