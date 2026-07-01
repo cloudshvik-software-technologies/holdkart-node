@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import * as c from '../controllers/productController.js';
+import * as vc from '../controllers/productVariantController.js';
 import { authenticate } from '../middleware/auth.js';
 
 const r = Router();
@@ -24,6 +25,7 @@ r.get('/personalized/suggested',    authenticate, c.getPersonalizedSuggested);
 
 // ── Parameterised routes last (so named routes above are matched first) ───────
 r.get('/:productId/delivery-estimate', c.getDeliveryEstimate);
+r.get('/:productId/variants',       vc.getVariants);
 r.get('/:productId',                c.getProduct);
 
 export default r;

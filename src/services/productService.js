@@ -32,6 +32,7 @@ const toProduct = (p) => {
     currentHold,
     hasCampaign,
     stock, remainingStock, active: Boolean(p.active),
+    hasVariants: Boolean(p.has_variants),
     warehouseLocation: p.warehouse_location,
     avgRating: Number(p.avg_rating) || 0, reviewCount: Number(p.review_count) || 0,
     specs: parseSpecs(p.specs),
@@ -94,7 +95,35 @@ export const getProduct = async (productId) => {
      GROUP BY p.id`,
     [productId]
   );
-  return rows[0] ? toProduct(rows[0]) : null;
+  if (!rows[0]) return null;
+  const product = toProduct(rows[0]);
+
+  // A product can have several active campaigns at once — e.g. "Red / M" is
+  // running a group deal while "Blue / L" of the same product is not, and
+  // is sold at the regular fixed price instead. The fields above only ever
+  // surface a single (variant-agnostic) campaign, which isn't enough for the
+  // detail page to know which specific colour/size combinations are
+  // actually in a deal. This returns every active campaign for the product,
+  // each tagged with the variant it targets (variantId is null for a
+  // whole-product campaign), so the frontend can match it against whichever
+  // variant the shopper has selected.
+  const [campaignRows] = await db.query(
+    `SELECT c.id, c.variant_id AS variantId, c.variant_label AS variantLabel,
+            c.hold_price AS holdPrice, c.target AS holdTarget,
+            COALESCE((SELECT COUNT(ch.id) FROM campaign_hold ch WHERE ch.campaign_id = c.id), 0) AS currentHold
+     FROM campaign c
+     WHERE c.product_id = ? AND c.status = 'ACTIVE'`,
+    [productId]
+  );
+  product.campaigns = campaignRows.map(c => ({
+    id: c.id,
+    variantId: c.variantId ?? null,
+    variantLabel: c.variantLabel ?? null,
+    holdPrice: Number(c.holdPrice) || 0,
+    holdTarget: Number(c.holdTarget) || 0,
+    currentHold: Number(c.currentHold) || 0,
+  }));
+  return product;
 };
 
 const SELLER_CATEGORIES = [
