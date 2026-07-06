@@ -598,7 +598,7 @@ async function _completeCampaignAndReset(campaign) {
     [campaign.id]
   );
 
-  const [priceRows] = await db.query('SELECT retail_price, hold_price, product_name FROM product WHERE id = ?', [campaign.product_id]);
+  const [priceRows] = await db.query('SELECT retail_price, hold_price, product_name, category FROM product WHERE id = ?', [campaign.product_id]);
   const productName   = priceRows[0]?.product_name || 'the product';
   // Prefer campaign-level prices (set via seller portal) over product-level prices
   const lockedPrice = (Number(campaign.hold_price) > 0 ? Number(campaign.hold_price) : null) ?? (Number(priceRows[0]?.hold_price) || null);
@@ -701,11 +701,38 @@ async function _completeCampaignAndReset(campaign) {
     const newTarget      = (campaign.target > 0 ? campaign.target : stockRows[0].hold_target) || 0;
     const newHoldPrice   = campaign.hold_price   || null;
     const newRetailPrice = campaign.retail_price || null;
+
+    // BUG FIX: this INSERT never set end_time (or product_name/category),
+    // so a campaign renewed through this path — the real-world trigger that
+    // fires the instant a customer's hold completes a deal — showed
+    // "Invalid Date" as its end date in the seller portal and lost its
+    // display name. Mirror holdkart-seller-node's autoRenewCampaign(): give
+    // the new round the SAME duration (in days) as the campaign that just
+    // completed, starting fresh from now, and carry the product name/category
+    // forward so the campaign list can render it properly.
+    let durationDays = 30;
+    if (campaign.start_time && campaign.end_time) {
+      const diff = Math.round((new Date(campaign.end_time) - new Date(campaign.start_time)) / (1000 * 60 * 60 * 24));
+      if (diff > 0) durationDays = diff;
+    }
+    const newEnd = new Date();
+    newEnd.setDate(newEnd.getDate() + durationDays);
+    const pad = n => String(n).padStart(2, '0');
+    const newEndTime = `${newEnd.getFullYear()}-${pad(newEnd.getMonth() + 1)}-${pad(newEnd.getDate())} 23:59:59`;
+
     if (newTarget > 0) {
       await db.query(
-        `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time, hold_price, retail_price, variant_id, variant_label, auto_renew)
-         VALUES (?, ?, ?, 0, 'ACTIVE', NOW(), ?, ?, ?, ?, ?)`,
-        [campaign.product_id, stockRows[0].seller_id, newTarget, newHoldPrice, newRetailPrice, campaign.variant_id || null, campaign.variant_label || null, autoRenewOn ? 1 : 0]
+        `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time, end_time, hold_price, retail_price, variant_id, variant_label, auto_renew, product_name, category)
+         VALUES (?, ?, ?, 0, 'ACTIVE', NOW(), ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          campaign.product_id, stockRows[0].seller_id, newTarget,
+          newEndTime,
+          newHoldPrice, newRetailPrice,
+          campaign.variant_id || null, campaign.variant_label || null,
+          autoRenewOn ? 1 : 0,
+          priceRows[0]?.product_name || null,
+          priceRows[0]?.category || null,
+        ]
       );
     }
   } else if (!autoRenewOn) {

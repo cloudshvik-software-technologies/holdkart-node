@@ -186,6 +186,31 @@ export const placeOrder = async ({
   if (!items || !items.length) throw new Error('No items in order');
   await ensureOrderVariantColumn();
 
+  // SECURITY FIX (critical payment bypass): this previously marked any order
+  // with paymentMethod === 'Online' as payment_status = 'Paid' immediately at
+  // creation, purely on the client's say-so — no payment had to actually
+  // happen. Anyone calling this endpoint directly (skipping the Cashfree
+  // checkout UI entirely) got instant "Paid" orders for free. The frontend
+  // already does the right thing (verifies with Cashfree, then sends the
+  // verified paymentId here — see Checkout.jsx), but the server never
+  // checked it. Now: for an "Online" order, payment is only considered
+  // verified if paymentId is supplied AND a fresh server-to-server check
+  // with Cashfree confirms that order is actually PAID. Anything else
+  // (missing paymentId, failed re-verification) falls back to 'Pending',
+  // exactly like an unpaid COD order — never silently 'Paid'.
+  let verifiedPaid = false;
+  if (paymentMethod === 'Online' && paymentId) {
+    try {
+      verifiedPaid = await paySvc.verifyPayment({ orderId: paymentId });
+    } catch (e) {
+      console.error('[placeOrder] payment re-verification failed:', e.message);
+      verifiedPaid = false;
+    }
+  }
+  const resolvedPaymentStatus = paymentMethod === 'Online'
+    ? (verifiedPaid ? 'Paid' : 'Pending')
+    : 'Pending';
+
   // One common order number for the whole checkout — every product placed
   // together shares this. Each product still gets its own row, distinguished
   // by a sub-order number (orderNumber + sequence).
@@ -283,7 +308,7 @@ export const placeOrder = async ({
         customer_courier_id, customer_courier_name)
        VALUES (?,?,?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?,?,?)`,
       [orderNumber, subOrderNumber, p.id, vId, p.seller_id, customerId, item.quantity, amount,
-       paymentMethod === 'Online' ? 'Paid' : 'Pending',
+       resolvedPaymentStatus,
        'Pending', address, p.category, p.product_name,
        customer?.name || '', paymentMethod,
        customer?.email || '', customer?.mobile || '', city, pincode, state,
@@ -824,7 +849,17 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
  * updateOrderStatus — called by seller panel to update order/delivery status.
  * Sends email notifications for Shipped, Delivered, and Refund Processed.
  */
-export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, refundAmount }) => {
+/**
+ * updateOrderStatus — called by seller panel to update order/delivery status.
+ * SECURITY FIX: this had zero ownership check (`WHERE o.id = ?` only) while
+ * living on the customer-authenticated router — any logged-in customer
+ * could change the order_status/delivery_status/refundAmount of ANY order
+ * in the system, not just their own, just by hitting this endpoint with a
+ * different orderId. Nothing in the current frontend actually calls this
+ * route, but it was still live and exploitable, so it's now scoped to the
+ * calling customer's own orders.
+ */
+export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, refundAmount, customerId }) => {
   const [rows] = await db.query(
     `SELECT o.*, c.name AS customerName, c.email AS customerEmail,
             sh.awb_code, sh.tracking_url
@@ -836,6 +871,12 @@ export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, 
   );
   if (!rows.length) { const e = new Error('Order not found'); e.status = 404; throw e; }
   const order = rows[0];
+
+  if (customerId != null && String(order.customer_id) !== String(customerId)) {
+    const e = new Error('You do not have permission to update this order');
+    e.status = 403;
+    throw e;
+  }
 
   const updateFields = [];
   const updateValues = [];
