@@ -102,8 +102,10 @@ export const debugProfile = async (_req, res) => {
     results.db_connection = 'FAILED: ' + e.message;
   }
   try {
-    const [rows] = await db.query('SHOW COLUMNS FROM customer');
-    results.customer_columns = rows.map(r => r.Field);
+    const [rows] = await db.query(
+      "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'customer'"
+    );
+    results.customer_columns = rows.map(r => r.column_name);
   } catch (e) {
     results.customer_columns = 'FAILED: ' + e.message;
   }

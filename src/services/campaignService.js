@@ -18,11 +18,11 @@ const ensureVariantColumn = async () => {
   variantColumnReady = (async () => {
     try {
       const [cols] = await db.query(
-        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'campaign_hold' AND COLUMN_NAME = 'variant_id'`
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'campaign_hold' AND column_name = 'variant_id'`
       );
       if (!cols.length) {
-        await db.query(`ALTER TABLE campaign_hold ADD COLUMN variant_id INT NOT NULL DEFAULT 0 AFTER product_id`);
+        await db.query(`ALTER TABLE campaign_hold ADD COLUMN variant_id INT NOT NULL DEFAULT 0`);
       }
     } catch (e) {
       console.error('campaign_hold variant_id migration check failed:', e.message);
@@ -36,10 +36,10 @@ export const listCampaigns = async () => {
     `SELECT c.*, p.product_name, p.image_url, p.description, p.category,
             COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
             COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price,
-            s.business_name AS sellerName,
-            ROUND((c.current_hold / c.target) * 100) AS progressPct
+            s.business_name AS "sellerName",
+            ROUND((c.current_hold / c.target) * 100) AS "progressPct"
      FROM campaign c
-     JOIN product p ON p.id = c.product_id AND p.active = 1
+     JOIN product p ON p.id = c.product_id AND p.active = true
      JOIN seller s ON s.id = c.seller_id
      WHERE c.status = 'ACTIVE' AND (c.end_time IS NULL OR c.end_time > NOW())
      ORDER BY c.start_time DESC`
@@ -52,7 +52,7 @@ export const joinCampaign = async ({ customerId, campaignId, quantity = 1 }) => 
 
   const [rows] = await db.query(
     `SELECT c.* FROM campaign c
-     JOIN product p ON p.id = c.product_id AND p.active = 1
+     JOIN product p ON p.id = c.product_id AND p.active = true
      WHERE c.id = ? AND c.status = 'ACTIVE'`,
     [campaignId]
   );
@@ -127,28 +127,28 @@ export const getMyCampaigns = async (customerId) => {
   // Ensure the customer_cancelled_deal tracking table exists
   await db.query(`
     CREATE TABLE IF NOT EXISTS customer_cancelled_deal (
-      id           INT AUTO_INCREMENT PRIMARY KEY,
+      id           SERIAL PRIMARY KEY,
       customer_id  INT NOT NULL,
       product_id   INT NOT NULL,
       campaign_id  INT,
-      cancelled_at DATETIME NOT NULL DEFAULT NOW(),
-      INDEX idx_ccd_customer (customer_id)
+      cancelled_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_ccd_customer ON customer_cancelled_deal (customer_id)`);
 
   // Part 1: ACTIVE and PAUSED deals (customer still has campaign_hold rows)
   const [activeRows] = await db.query(
-    `SELECT MIN(ch.id) AS holdId, ch.campaign_id, c.id AS campaignRowId, ch.customer_id,
+    `SELECT MIN(ch.id) AS "holdId", ch.campaign_id, c.id AS "campaignRowId", ch.customer_id,
             ch.product_id, MIN(ch.joined_date) AS joined_date,
-            c.status AS campaignStatus, c.target, c.current_hold,
-            c.variant_id AS variantId, c.variant_label AS variantLabel,
-            COUNT(ch.id) AS mySlots,
+            c.status AS "campaignStatus", c.target, c.current_hold,
+            c.variant_id AS "variantId", c.variant_label AS "variantLabel",
+            COUNT(ch.id) AS "mySlots",
             p.product_name, p.image_url, p.category,
             COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
             COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price,
-            pv.color AS variantColor, pv.size AS variantSize,
+            pv.color AS "variantColor", pv.size AS "variantSize",
             (SELECT vi.image_url FROM product_variant_image vi
-             WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS variantImage
+             WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS "variantImage"
      FROM campaign_hold ch
      JOIN campaign c ON c.id = ch.campaign_id
      LEFT JOIN product p ON p.id = ch.product_id
@@ -164,17 +164,17 @@ export const getMyCampaigns = async (customerId) => {
 
   // Part 2: Seller-cancelled deals (campaign status = CANCELLED, hold rows may still exist)
   const [sellerCancelledRows] = await db.query(
-    `SELECT MIN(ch.id) AS holdId, ch.campaign_id, c.id AS campaignRowId, ch.customer_id,
+    `SELECT MIN(ch.id) AS "holdId", ch.campaign_id, c.id AS "campaignRowId", ch.customer_id,
             ch.product_id, MIN(ch.joined_date) AS joined_date,
-            'CANCELLED' AS campaignStatus, c.target, c.current_hold,
-            c.variant_id AS variantId, c.variant_label AS variantLabel,
-            COUNT(ch.id) AS mySlots,
+            'CANCELLED' AS "campaignStatus", c.target, c.current_hold,
+            c.variant_id AS "variantId", c.variant_label AS "variantLabel",
+            COUNT(ch.id) AS "mySlots",
             p.product_name, p.image_url, p.category,
             COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
             COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price,
-            pv.color AS variantColor, pv.size AS variantSize,
+            pv.color AS "variantColor", pv.size AS "variantSize",
             (SELECT vi.image_url FROM product_variant_image vi
-             WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS variantImage
+             WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS "variantImage"
      FROM campaign_hold ch
      JOIN campaign c ON c.id = ch.campaign_id
      LEFT JOIN product p ON p.id = ch.product_id
@@ -190,18 +190,18 @@ export const getMyCampaigns = async (customerId) => {
 
   // Part 3: Customer-cancelled deals (removed DEAL item from cart after deal completed)
   const [customerCancelledRows] = await db.query(
-    `SELECT ccd.id AS holdId, ccd.campaign_id, ccd.campaign_id AS campaignRowId, ccd.customer_id,
+    `SELECT ccd.id AS "holdId", ccd.campaign_id, ccd.campaign_id AS "campaignRowId", ccd.customer_id,
             ccd.product_id, ccd.cancelled_at AS joined_date,
-            'CANCELLED' AS campaignStatus,
+            'CANCELLED' AS "campaignStatus",
             COALESCE(c.target, 0) AS target, COALESCE(c.current_hold, 0) AS current_hold,
-            c.variant_id AS variantId, c.variant_label AS variantLabel,
-            1 AS mySlots,
+            c.variant_id AS "variantId", c.variant_label AS "variantLabel",
+            1 AS "mySlots",
             p.product_name, p.image_url, p.category,
             COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
             COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price,
-            pv.color AS variantColor, pv.size AS variantSize,
+            pv.color AS "variantColor", pv.size AS "variantSize",
             (SELECT vi.image_url FROM product_variant_image vi
-             WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS variantImage
+             WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS "variantImage"
      FROM customer_cancelled_deal ccd
      LEFT JOIN campaign c ON c.id = ccd.campaign_id
      LEFT JOIN product p ON p.id = ccd.product_id
@@ -243,7 +243,7 @@ export const getProductCampaignStatus = async (productId) => {
   const [rows] = await db.query(
     `SELECT status FROM campaign
      WHERE product_id = ? AND status IN ('ACTIVE', 'PAUSED')
-     ORDER BY FIELD(status, 'ACTIVE', 'PAUSED') ASC
+     ORDER BY CASE status WHEN 'ACTIVE' THEN 0 WHEN 'PAUSED' THEN 1 ELSE 2 END ASC
      LIMIT 1`,
     [productId]
   );
@@ -255,13 +255,13 @@ export const getCampaignById = async (campaignId) => {
     `SELECT c.*, p.product_name, p.image_url, p.description,
             COALESCE(NULLIF(c.retail_price, 0), p.retail_price) AS retail_price,
             COALESCE(NULLIF(c.hold_price, 0), p.hold_price)     AS hold_price,
-            s.business_name AS sellerName,
-            ROUND((c.current_hold / c.target) * 100) AS progressPct,
+            s.business_name AS "sellerName",
+            ROUND((c.current_hold / c.target) * 100) AS "progressPct",
             pv.color AS variant_color, pv.size AS variant_size,
             (SELECT vi.image_url FROM product_variant_image vi
              WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS variant_image
      FROM campaign c
-     JOIN product p ON p.id = c.product_id AND p.active = 1
+     JOIN product p ON p.id = c.product_id AND p.active = true
      JOIN seller s  ON s.id = c.seller_id
      LEFT JOIN product_variant pv ON pv.id = c.variant_id
      WHERE c.id = ?`,
@@ -284,7 +284,7 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
   await ensureVariantColumn();
 
   const [products] = await db.query(
-    'SELECT id, seller_id, hold_target FROM product WHERE id = ? AND active = 1',
+    'SELECT id, seller_id, hold_target FROM product WHERE id = ? AND active = true',
     [productId]
   );
   if (!products.length) { const e = new Error('Product not found or no longer available'); e.status = 404; throw e; }
@@ -534,7 +534,7 @@ async function _cancelCampaignsForDeletedProducts(customerId) {
     `SELECT ch.campaign_id, ch.product_id
      FROM campaign_hold ch
      JOIN campaign c ON c.id = ch.campaign_id AND c.status = 'ACTIVE'
-     JOIN product p ON p.id = ch.product_id AND p.active = 0
+     JOIN product p ON p.id = ch.product_id AND p.active = false
      WHERE ch.customer_id = ?`,
     [customerId]
   );
@@ -632,7 +632,7 @@ async function _completeCampaignAndReset(campaign) {
   await db.query('DELETE FROM campaign_hold WHERE campaign_id = ?', [campaign.id]);
 
   const [stockRows] = await db.query(
-    'SELECT stock_quantity, hold_target, seller_id FROM product WHERE id = ? AND active = 1',
+    'SELECT stock_quantity, hold_target, seller_id FROM product WHERE id = ? AND active = true',
     [campaign.product_id]
   );
 

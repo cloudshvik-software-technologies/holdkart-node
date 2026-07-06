@@ -8,8 +8,10 @@ let _colCache = null;
 
 async function getCols() {
   if (_colCache) return _colCache;
-  const [rows] = await db.query('SHOW COLUMNS FROM customer');
-  _colCache = new Set(rows.map(r => r.Field));
+  const [rows] = await db.query(
+    "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'customer'"
+  );
+  _colCache = new Set(rows.map(r => r.column_name));
   return _colCache;
 }
 
@@ -51,7 +53,7 @@ export const updateProfile = async ({ customerId, name, mobile, address, city, s
 export const uploadProfileImage = async ({ customerId, imageUrl }) => {
   const cols = await getCols();
   if (!cols.has('profile_image')) {
-    await db.query('ALTER TABLE customer ADD COLUMN IF NOT EXISTS profile_image LONGTEXT');
+    await db.query('ALTER TABLE customer ADD COLUMN IF NOT EXISTS profile_image TEXT');
     invalidateColCache();
   }
   await db.query('UPDATE customer SET profile_image = ? WHERE id = ?', [imageUrl, customerId]);
@@ -73,11 +75,11 @@ const REACTIVATION_WINDOW_DAYS = 30;
 async function ensureDeactivationCols() {
   const cols = await getCols();
   if (!cols.has('deactivated_at')) {
-    await db.query('ALTER TABLE customer ADD COLUMN deactivated_at DATETIME NULL');
+    await db.query('ALTER TABLE customer ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMP NULL');
     invalidateColCache();
   }
   if (!cols.has('permanently_deleted_at')) {
-    await db.query('ALTER TABLE customer ADD COLUMN permanently_deleted_at DATETIME NULL');
+    await db.query('ALTER TABLE customer ADD COLUMN IF NOT EXISTS permanently_deleted_at TIMESTAMP NULL');
     invalidateColCache();
   }
   if (!cols.has('deactivation_reason')) {

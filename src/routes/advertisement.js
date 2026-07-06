@@ -41,7 +41,7 @@ router.get('/active', async (req, res) => {
       params.push(type);
     }
 
-    query += ' ORDER BY RAND()';
+    query += ' ORDER BY RANDOM()';
 
     const [rows] = await db.query(query, params);
 
@@ -51,7 +51,7 @@ router.get('/active', async (req, res) => {
         const days = row.duration_days || 7;
         await db.query(
           `UPDATE seller_advertisement
-           SET status = 'active', start_date = DATE(NOW()), end_date = DATE_ADD(DATE(NOW()), INTERVAL ? DAY)
+           SET status = 'active', start_date = DATE(NOW()), end_date = DATE(NOW()) + (? * INTERVAL '1 day')
            WHERE id = ? AND start_date IS NULL`,
           [days, row.id]
         );

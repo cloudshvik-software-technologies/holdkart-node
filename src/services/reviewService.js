@@ -32,10 +32,10 @@ export const addReview = async ({ customerId, productId, rating, comment, imageP
   const [result] = await db.query(
     `INSERT INTO review (customer_id, product_id, order_id, rating, comment)
      VALUES (?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE
-       rating   = VALUES(rating),
-       comment  = VALUES(comment),
-       order_id = VALUES(order_id)`,
+     ON CONFLICT (customer_id, product_id) DO UPDATE SET
+       rating   = EXCLUDED.rating,
+       comment  = EXCLUDED.comment,
+       order_id = EXCLUDED.order_id`,
     [customerId, productId, orderId, rating, comment || '']
   );
 
@@ -70,7 +70,7 @@ export const addReview = async ({ customerId, productId, rating, comment, imageP
  */
 export const getMyReview = async ({ customerId, orderId }) => {
   const [rows] = await db.query(
-    `SELECT r.*, c.name AS customerName
+    `SELECT r.*, c.name AS "customerName"
      FROM review r
      JOIN customer c ON c.id = r.customer_id
      WHERE r.customer_id = ? AND r.order_id = ?
@@ -113,7 +113,7 @@ export const getReviewedProducts = async (customerId) => {
 
 export const getProductReviews = async (productId, customerId = null) => {
   const [rows] = await db.query(
-    `SELECT r.*, c.name AS customerName,
+    `SELECT r.*, c.name AS "customerName",
             (SELECT COUNT(*) FROM review_like rl WHERE rl.review_id = r.id) AS likes
      FROM review r
      JOIN customer c ON c.id = r.customer_id

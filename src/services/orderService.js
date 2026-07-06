@@ -15,7 +15,7 @@ const notifySeller = async (sellerId, title, message) => {
   try {
     await db.query(
       `INSERT INTO seller_notification (seller_id, title, message, created_date, read_status)
-       VALUES (?, ?, ?, NOW(), 0)`,
+       VALUES (?, ?, ?, NOW(), false)`,
       [sellerId, title, message]
     );
   } catch (e) {
@@ -27,8 +27,8 @@ const notifySeller = async (sellerId, title, message) => {
 const ensureEmailTrackingColumns = async () => {
   try {
     await db.query(`ALTER TABLE orders
-      ADD COLUMN delivered_email_sent_at DATETIME NULL,
-      ADD COLUMN invoice_email_sent_at DATETIME NULL`);
+      ADD COLUMN IF NOT EXISTS delivered_email_sent_at TIMESTAMP NULL,
+      ADD COLUMN IF NOT EXISTS invoice_email_sent_at TIMESTAMP NULL`);
   } catch {}
 };
 
@@ -83,13 +83,13 @@ export const startInvoiceEmailPoller = () => {
       await ensureEmailTrackingColumns();
 
       const [rows] = await db.query(
-        `SELECT o.*, s.business_name AS sellerName, s.email AS sellerEmail, c.email AS customerEmail, c.name AS customerName
+        `SELECT o.*, s.business_name AS "sellerName", s.email AS "sellerEmail", c.email AS "customerEmail", c.name AS "customerName"
          FROM orders o
          LEFT JOIN seller s ON s.id = o.seller_id
          LEFT JOIN customer c ON c.id = o.customer_id
          WHERE o.delivered_email_sent_at IS NOT NULL
            AND o.invoice_email_sent_at IS NULL
-           AND o.delivered_email_sent_at <= (NOW() - INTERVAL 10 MINUTE)`
+           AND o.delivered_email_sent_at <= (NOW() - INTERVAL '10 minutes')`
       );
 
       for (const order of rows) {
@@ -144,7 +144,7 @@ export const placeOrder = async ({
 
   const results = [];
   for (const item of items) {
-    const [prows] = await db.query('SELECT * FROM product WHERE id = ? AND active = 1', [item.productId]);
+    const [prows] = await db.query('SELECT * FROM product WHERE id = ? AND active = true', [item.productId]);
     if (!prows.length) throw Object.assign(new Error(`Product ${item.productId} not found`), { status: 404 });
     const p = prows[0];
     if (p.stock_quantity < item.quantity) throw Object.assign(new Error(`Insufficient stock for ${p.product_name}`), { status: 400 });
@@ -323,13 +323,13 @@ export const placeOrder = async ({
         `INSERT INTO shipping
            (order_id, shiprocket_order_id, shiprocket_shipment_id, awb_code, courier_id, label_url, tracking_url, tracking_id)
          VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
-         ON DUPLICATE KEY UPDATE
-           shiprocket_order_id  = VALUES(shiprocket_order_id),
-           shiprocket_shipment_id = VALUES(shiprocket_shipment_id),
-           awb_code             = VALUES(awb_code),
-           courier_id           = VALUES(courier_id),
-           label_url            = VALUES(label_url),
-           tracking_url         = VALUES(tracking_url)`,
+         ON CONFLICT (order_id) DO UPDATE SET
+           shiprocket_order_id  = EXCLUDED.shiprocket_order_id,
+           shiprocket_shipment_id = EXCLUDED.shiprocket_shipment_id,
+           awb_code             = EXCLUDED.awb_code,
+           courier_id           = EXCLUDED.courier_id,
+           label_url            = EXCLUDED.label_url,
+           tracking_url         = EXCLUDED.tracking_url`,
         [
           r.insertId,
           sr.shiprocketOrderId    || null,
@@ -445,7 +445,7 @@ export const trackOrder = async (orderId, customerId) => {
 
 export const listOrders = async (customerId) => {
   const [rows] = await db.query(
-    `SELECT o.*, s.business_name AS sellerName,
+    `SELECT o.*, s.business_name AS "sellerName",
        (SELECT COUNT(*) FROM order_cancel_request ocr
         WHERE ocr.order_id = o.id
           AND ocr.resolution_type = 'Replace'
@@ -470,7 +470,7 @@ export const listOrders = async (customerId) => {
 
 export const getOrder = async (orderId, customerId) => {
   const [rows] = await db.query(
-    `SELECT o.*, s.business_name AS sellerName, s.email AS sellerEmail,
+    `SELECT o.*, s.business_name AS "sellerName", s.email AS "sellerEmail",
        p.image_url AS product_image_raw,
        sh.awb_code, sh.shiprocket_order_id, sh.shiprocket_shipment_id,
        sh.tracking_url, sh.label_url, sh.courier_id
@@ -703,7 +703,7 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
  */
 export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, refundAmount }) => {
   const [rows] = await db.query(
-    `SELECT o.*, c.name AS customerName, c.email AS customerEmail,
+    `SELECT o.*, c.name AS "customerName", c.email AS "customerEmail",
             sh.awb_code, sh.tracking_url
      FROM orders o
      LEFT JOIN customer c ON c.id = o.customer_id
