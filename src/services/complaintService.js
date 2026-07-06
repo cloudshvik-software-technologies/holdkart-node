@@ -18,35 +18,32 @@ const resolveImage = (raw) => {
   try {
     await db.query(`
       CREATE TABLE IF NOT EXISTS customer_complaint (
-        id                  INT AUTO_INCREMENT PRIMARY KEY,
+        id                  SERIAL PRIMARY KEY,
         customer_id         INT          NOT NULL,
         order_id            INT          DEFAULT NULL,
         subject             VARCHAR(255) NOT NULL,
         description         TEXT         NOT NULL,
         status              VARCHAR(50)  NOT NULL DEFAULT 'Open',
         seller_complaint_id INT          DEFAULT NULL,
-        created_date        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        resolved_date       DATETIME     DEFAULT NULL,
-        INDEX idx_customer (customer_id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        created_date        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        resolved_date       TIMESTAMP    DEFAULT NULL
+      )
     `);
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_customer ON customer_complaint (customer_id)`);
   } catch (e) {
     console.error('[complaintService] table init error:', e.message);
   }
 
   // Backfill the link column for tables created before this change.
-  // (Plain ALTER + ignore "duplicate column" instead of IF NOT EXISTS,
-  // since that syntax needs MySQL 8.0.29+ and isn't supported on older
-  // MySQL/MariaDB versions.)
+  // Postgres supports ADD COLUMN IF NOT EXISTS directly, so no error-code
+  // dance is needed here (that was a MySQL-version workaround).
   try {
     await db.query(`
       ALTER TABLE customer_complaint
-      ADD COLUMN seller_complaint_id INT DEFAULT NULL
+      ADD COLUMN IF NOT EXISTS seller_complaint_id INT DEFAULT NULL
     `);
   } catch (e) {
-    if (e.code !== 'ER_DUP_FIELDNAME') {
-      console.error('[complaintService] column backfill error:', e.message);
-    }
+    console.error('[complaintService] column backfill error:', e.message);
   }
 
   // The seller-side "complaint" table previously had no dedicated subject
@@ -56,12 +53,10 @@ const resolveImage = (raw) => {
   try {
     await db.query(`
       ALTER TABLE complaint
-      ADD COLUMN subject VARCHAR(255) DEFAULT NULL
+      ADD COLUMN IF NOT EXISTS subject VARCHAR(255) DEFAULT NULL
     `);
   } catch (e) {
-    if (e.code !== 'ER_DUP_FIELDNAME') {
-      console.error('[complaintService] subject column backfill error:', e.message);
-    }
+    console.error('[complaintService] subject column backfill error:', e.message);
   }
 })();
 

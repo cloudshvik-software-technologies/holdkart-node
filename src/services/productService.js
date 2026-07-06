@@ -97,7 +97,7 @@ const PRODUCT_SELECT = `SELECT p.*,
    WHERE c7.product_id = p.id AND c7.status = 'ACTIVE' AND (c7.end_time IS NULL OR c7.end_time > NOW())
      AND c7.variant_id IS NOT NULL) AS active_variant_campaign_count
   FROM product p LEFT JOIN review r ON r.product_id = p.id
-  WHERE p.active = 1 AND p.stock_quantity > 0`;
+  WHERE p.active = true AND p.stock_quantity > 0`;
 
 export const listProducts = async ({ search, category, minPrice, maxPrice, rating, page = 1, limit = 20 }) => {
   let sql = PRODUCT_SELECT;
@@ -134,8 +134,8 @@ export const getProduct = async (productId) => {
      FROM product p
      LEFT JOIN seller s ON s.id = p.seller_id
      LEFT JOIN review r ON r.product_id = p.id
-     WHERE p.id = ? AND p.active = 1
-     GROUP BY p.id`,
+     WHERE p.id = ? AND p.active = true
+     GROUP BY p.id, s.business_name`,
     [productId]
   );
   if (!rows[0]) return null;
@@ -151,9 +151,9 @@ export const getProduct = async (productId) => {
   // whole-product campaign), so the frontend can match it against whichever
   // variant the shopper has selected.
   const [campaignRows] = await db.query(
-    `SELECT c.id, c.variant_id AS variantId, c.variant_label AS variantLabel,
-            c.hold_price AS holdPrice, c.target AS holdTarget,
-            COALESCE((SELECT COUNT(ch.id) FROM campaign_hold ch WHERE ch.campaign_id = c.id), 0) AS currentHold
+    `SELECT c.id, c.variant_id AS "variantId", c.variant_label AS "variantLabel",
+            c.hold_price AS "holdPrice", c.target AS "holdTarget",
+            COALESCE((SELECT COUNT(ch.id) FROM campaign_hold ch WHERE ch.campaign_id = c.id), 0) AS "currentHold"
      FROM campaign c
      WHERE c.product_id = ? AND c.status = 'ACTIVE'`,
     [productId]
@@ -190,14 +190,14 @@ export const getFeaturedProducts = async ({ page = 1, limit = 10 } = {}) => {
 export const ensureBrowsingHistoryTable = async () => {
   await db.query(`
     CREATE TABLE IF NOT EXISTS browsing_history (
-      id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+      id            BIGSERIAL PRIMARY KEY,
       customer_id   INT NOT NULL,
       product_id    INT NOT NULL,
-      viewed_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_customer_product (customer_id, product_id),
-      INDEX idx_viewed (viewed_at)
+      viewed_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (customer_id, product_id)
     )
   `);
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_viewed ON browsing_history (viewed_at)`);
 };
 
 // ── Track a product view ──────────────────────────────────────────────────────
@@ -207,7 +207,7 @@ export const trackProductView = async (customerId, productId) => {
     await db.query(`
       INSERT INTO browsing_history (customer_id, product_id, viewed_at)
       VALUES (?, ?, NOW())
-      ON DUPLICATE KEY UPDATE viewed_at = NOW()
+      ON CONFLICT (customer_id, product_id) DO UPDATE SET viewed_at = EXCLUDED.viewed_at
     `, [customerId, productId]);
     // Prune: keep last 50 views per customer
     await db.query(`
@@ -238,7 +238,7 @@ export const getPersonalizedBrowsing = async (customerId, limit = 14) => {
       FROM browsing_history bh
       JOIN product p ON p.id = bh.product_id
       WHERE bh.customer_id = ?
-        AND bh.viewed_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
+        AND bh.viewed_at > NOW() - INTERVAL '30 days'
       GROUP BY p.category
       ORDER BY cnt DESC
       LIMIT 5
@@ -372,7 +372,7 @@ export const getPersonalizedSuggested = async (customerId, limit = 14) => {
       FROM browsing_history bh
       JOIN product p ON p.id = bh.product_id
       WHERE bh.customer_id = ?
-        AND bh.viewed_at > DATE_SUB(NOW(), INTERVAL 60 DAY)
+        AND bh.viewed_at > NOW() - INTERVAL '60 days'
       GROUP BY p.category
       ORDER BY cnt DESC
       LIMIT 5

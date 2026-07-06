@@ -7,7 +7,7 @@
 // product detail page can offer a colour/size selector with per-variant
 // pricing and stock, the same way the seller already sees it.
 //
-// Live DB columns (shared MySQL instance):
+// Live DB columns (shared Postgres instance):
 //   product_variant:
 //     id, product_id, sku, color, size, price_override, stock_quantity,
 //     reserved_stock, min_stock_level, active, created_at
@@ -60,7 +60,7 @@ const fetchImagesForVariants = async (variantIds) => {
 // consistent between the two portals.
 export const getVariants = async (productId) => {
   const [rows] = await db.query(
-    `SELECT * FROM product_variant WHERE product_id = ? AND active = 1 ORDER BY color, size`,
+    `SELECT * FROM product_variant WHERE product_id = ? AND active = true ORDER BY color, size`,
     [productId]
   );
   const activeRows = rows.filter((r) => isActive(r.active));

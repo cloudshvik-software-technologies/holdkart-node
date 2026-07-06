@@ -28,31 +28,34 @@ const ensureVariantColumn = async () => {
   variantColumnReady = (async () => {
     try {
       const [cols] = await db.query(
-        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cart' AND COLUMN_NAME = 'variant_id'`
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'cart' AND column_name = 'variant_id'`
       );
       if (!cols.length) {
-        await db.query(`ALTER TABLE cart ADD COLUMN variant_id INT NOT NULL DEFAULT 0 AFTER product_id`);
+        await db.query(`ALTER TABLE cart ADD COLUMN variant_id INT NOT NULL DEFAULT 0`);
       }
 
-      // Find any unique key covering (customer_id, product_id, price_type)
+      // Find any unique constraint covering (customer_id, product_id, price_type)
       // that does NOT already include variant_id, and widen it — otherwise
       // inserting a second variant for the same product still collides
       // against the old constraint.
       const [rows] = await db.query(
-        `SELECT INDEX_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS cols
-         FROM INFORMATION_SCHEMA.STATISTICS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cart'
-           AND NON_UNIQUE = 0 AND INDEX_NAME != 'PRIMARY'
-         GROUP BY INDEX_NAME`
+        `SELECT tc.constraint_name AS "INDEX_NAME",
+                STRING_AGG(kcu.column_name, ',' ORDER BY kcu.ordinal_position) AS cols
+         FROM information_schema.table_constraints tc
+         JOIN information_schema.key_column_usage kcu
+           ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+         WHERE tc.table_schema = current_schema() AND tc.table_name = 'cart'
+           AND tc.constraint_type = 'UNIQUE'
+         GROUP BY tc.constraint_name`
       );
       const staleKey = rows.find(r => {
         const c = (r.cols || '').split(',');
         return c.includes('customer_id') && c.includes('product_id') && c.includes('price_type') && !c.includes('variant_id');
       });
       if (staleKey) {
-        await db.query(`ALTER TABLE cart DROP INDEX \`${staleKey.INDEX_NAME}\``);
-        await db.query(`ALTER TABLE cart ADD UNIQUE KEY uniq_cart_item (customer_id, product_id, variant_id, price_type)`);
+        await db.query(`ALTER TABLE cart DROP CONSTRAINT "${staleKey.INDEX_NAME}"`);
+        await db.query(`ALTER TABLE cart ADD CONSTRAINT uniq_cart_item UNIQUE (customer_id, product_id, variant_id, price_type)`);
       }
     } catch (e) {
       // Non-fatal — if this partially applied before, later calls just find
@@ -75,7 +78,7 @@ export const addToCart = async ({ customerId, productId, variantId, quantity = 1
     // availability, not the base product's stock_quantity.
     const [variantRows] = await db.query(
       `SELECT stock_quantity, reserved_stock FROM product_variant
-       WHERE id = ? AND product_id = ? AND active = 1 LIMIT 1`,
+       WHERE id = ? AND product_id = ? AND active = true LIMIT 1`,
       [vId, productId]
     );
     if (!variantRows.length) {
@@ -105,7 +108,7 @@ export const addToCart = async ({ customerId, productId, variantId, quantity = 1
       remainingStock = Math.max(0, stock_quantity - current_hold);
     } else {
       const [productRows] = await db.query(
-        `SELECT stock_quantity FROM product WHERE id = ? AND active = 1 LIMIT 1`,
+        `SELECT stock_quantity FROM product WHERE id = ? AND active = true LIMIT 1`,
         [productId]
       );
 
@@ -150,37 +153,37 @@ export const getCart = async (customerId) => {
   await ensureVariantColumn();
   const [rows] = await db.query(
     `SELECT
-       c.id             AS cartId,
+       c.id             AS "cartId",
        c.quantity,
-       c.product_id     AS productId,
-       c.variant_id     AS variantId,
-       c.price_type     AS priceType,
+       c.product_id     AS "productId",
+       c.variant_id     AS "variantId",
+       c.price_type     AS "priceType",
        c.added_date,
-       c.locked_price   AS lockedPrice,
-       c.deposit_paid   AS depositPaid,
+       c.locked_price   AS "lockedPrice",
+       c.deposit_paid   AS "depositPaid",
        p.product_name   AS name,
-       p.retail_price   AS retailPrice,
-       p.hold_price     AS holdPrice,
+       p.retail_price   AS "retailPrice",
+       p.hold_price     AS "holdPrice",
        p.image_url,
        p.stock_quantity AS stock,
        p.category,
-       p.hold_target    AS holdTarget,
+       p.hold_target    AS "holdTarget",
        p.specs,
-       pv.color           AS variantColor,
-       pv.size            AS variantSize,
-       pv.price_override  AS variantPrice,
-       pv.stock_quantity  AS variantStock,
-       pv.reserved_stock  AS variantReserved,
+       pv.color           AS "variantColor",
+       pv.size            AS "variantSize",
+       pv.price_override  AS "variantPrice",
+       pv.stock_quantity  AS "variantStock",
+       pv.reserved_stock  AS "variantReserved",
        (SELECT vi.image_url FROM product_variant_image vi
-        WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS variantImage,
+        WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS "variantImage",
        (SELECT cam.hold_price FROM campaign cam
         WHERE cam.product_id = c.product_id AND cam.hold_price > 0
-        ORDER BY cam.id DESC LIMIT 1) AS campaignHoldPrice,
+        ORDER BY cam.id DESC LIMIT 1) AS "campaignHoldPrice",
        (SELECT cam.retail_price FROM campaign cam
         WHERE cam.product_id = c.product_id AND cam.retail_price > 0
-        ORDER BY cam.id DESC LIMIT 1) AS campaignRetailPrice
+        ORDER BY cam.id DESC LIMIT 1) AS "campaignRetailPrice"
      FROM cart c
-     JOIN product p ON p.id = c.product_id AND p.active = 1
+     JOIN product p ON p.id = c.product_id AND p.active = true
      LEFT JOIN product_variant pv ON pv.id = c.variant_id AND pv.product_id = c.product_id
      WHERE c.customer_id = ?
      ORDER BY c.added_date DESC`,
@@ -260,14 +263,14 @@ export const removeFromCart = async ({ customerId, cartId }) => {
   // Ensure the customer_cancelled_deal tracking table exists
   await db.query(`
     CREATE TABLE IF NOT EXISTS customer_cancelled_deal (
-      id           INT AUTO_INCREMENT PRIMARY KEY,
+      id           SERIAL PRIMARY KEY,
       customer_id  INT NOT NULL,
       product_id   INT NOT NULL,
       campaign_id  INT,
-      cancelled_at DATETIME NOT NULL DEFAULT NOW(),
-      INDEX idx_ccd_customer (customer_id)
+      cancelled_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_ccd_customer ON customer_cancelled_deal (customer_id)`);
 
   // Fetch the cart row first so we know the price_type and product
   const [rows] = await db.query(

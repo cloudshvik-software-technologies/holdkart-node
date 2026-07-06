@@ -10,15 +10,15 @@ import db from '../config/db.js';
 
   export const markRead = async ({ customerId, notificationId }) => {
     if (notificationId) {
-      await db.query('UPDATE customer_notification SET is_read=1 WHERE id=? AND customer_id=?', [notificationId, customerId]);
+      await db.query('UPDATE customer_notification SET is_read=true WHERE id=? AND customer_id=?', [notificationId, customerId]);
     } else {
-      await db.query('UPDATE customer_notification SET is_read=1 WHERE customer_id=?', [customerId]);
+      await db.query('UPDATE customer_notification SET is_read=true WHERE customer_id=?', [customerId]);
     }
     return { message: 'Marked as read' };
   };
 
   export const getUnreadCount = async (customerId) => {
-    const [rows] = await db.query('SELECT COUNT(*) AS cnt FROM customer_notification WHERE customer_id=? AND is_read=0', [customerId]);
+    const [rows] = await db.query('SELECT COUNT(*) AS cnt FROM customer_notification WHERE customer_id=? AND is_read=false', [customerId]);
     return { count: rows[0].cnt };
   };
   

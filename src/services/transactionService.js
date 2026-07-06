@@ -7,7 +7,7 @@ import db from '../config/db.js';
 export const ensureTable = async () => {
   await db.query(`
     CREATE TABLE IF NOT EXISTS customer_transaction (
-      id             INT AUTO_INCREMENT PRIMARY KEY,
+      id             SERIAL PRIMARY KEY,
       customer_id    INT          NOT NULL,
       order_id       INT          DEFAULT NULL,
       order_number   VARCHAR(50)  DEFAULT NULL,
@@ -17,11 +17,11 @@ export const ensureTable = async () => {
       status         VARCHAR(30)  NOT NULL DEFAULT 'SUCCESS',
       description    VARCHAR(500) DEFAULT NULL,
       cashfree_order_id VARCHAR(100) DEFAULT NULL,
-      created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_customer (customer_id),
-      INDEX idx_order    (order_id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      created_at     TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
   `);
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_customer_txn_customer ON customer_transaction (customer_id)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_customer_txn_order ON customer_transaction (order_id)`);
 };
 
 /**
