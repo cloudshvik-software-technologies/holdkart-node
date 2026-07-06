@@ -31,6 +31,31 @@ const ensureVariantColumn = async () => {
   return variantColumnReady;
 };
 
+// ── auto_renew migration ────────────────────────────────────────────────────
+// Mirrors the same column added from the seller portal (holdkart-seller-node).
+// Both backends share one database, but whichever service boots/runs first
+// wins the race to create the column — so this check must live here too,
+// otherwise a customer completing a deal before the seller backend has ever
+// started would hit an "unknown column" error on the renewal INSERT below.
+let autoRenewColumnReady = null;
+const ensureAutoRenewColumn = async () => {
+  if (autoRenewColumnReady) return autoRenewColumnReady;
+  autoRenewColumnReady = (async () => {
+    try {
+      const [cols] = await db.query(
+        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'campaign' AND COLUMN_NAME = 'auto_renew'`
+      );
+      if (!cols.length) {
+        await db.query(`ALTER TABLE campaign ADD COLUMN auto_renew TINYINT(1) NOT NULL DEFAULT 0 AFTER target`);
+      }
+    } catch (e) {
+      console.error('campaign auto_renew migration check failed:', e.message);
+    }
+  })();
+  return autoRenewColumnReady;
+};
+
 export const listCampaigns = async () => {
   const [rows] = await db.query(
     `SELECT c.*, p.product_name, p.image_url, p.description, p.category,
@@ -315,10 +340,20 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
   }
 
   if (!campaign) {
+    // BUG FIX: previously this INSERT never set variant_id/variant_label, so the
+    // very first customer to start a deal for a specific colour/size (no existing
+    // campaign yet) created a campaign that looked whole-product — losing which
+    // variant it was actually for. Persist the variant the customer selected so
+    // later joins/completions stay scoped to it correctly.
+    let variantLabel = null;
+    if (variantId) {
+      const [vRows] = await db.query('SELECT color, size FROM product_variant WHERE id = ? AND product_id = ?', [variantId, productId]);
+      if (vRows.length) variantLabel = [vRows[0].color, vRows[0].size].filter(Boolean).join(' / ') || null;
+    }
     const [result] = await db.query(
-      `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time)
-       VALUES (?, ?, ?, 0, 'ACTIVE', NOW())`,
-      [productId, product.seller_id, effectiveTarget]
+      `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time, variant_id, variant_label)
+       VALUES (?, ?, ?, 0, 'ACTIVE', NOW(), ?, ?)`,
+      [productId, product.seller_id, effectiveTarget, variantId || null, variantLabel]
     );
     const [newCampaign] = await db.query('SELECT * FROM campaign WHERE id = ?', [result.insertId]);
     campaign = newCampaign[0];
@@ -549,6 +584,7 @@ async function _cancelCampaignsForDeletedProducts(customerId) {
  * Groups rows by customer so each customer gets the correct quantity in cart.
  */
 async function _completeCampaignAndReset(campaign) {
+  await ensureAutoRenewColumn();
   await db.query("UPDATE campaign SET status = 'COMPLETED' WHERE id = ?", [campaign.id]);
 
   // Group by customer AND variant so each customer's chosen colour/size
@@ -650,17 +686,29 @@ async function _completeCampaignAndReset(campaign) {
     variantStockOk = variantStockRows.length && variantStockRows[0].stock_quantity > 0;
   }
 
-  if (stockRows.length && stockRows[0].stock_quantity > 0 && variantStockOk) {
+  // BUG FIX: this auto-renewal previously fired unconditionally whenever stock
+  // allowed it, with no way for the seller to opt out — even after they flipped
+  // the "Auto-renew on completion" toggle off in the seller portal. That toggle
+  // writes to campaign.auto_renew, but this function (the one that actually runs
+  // whenever a customer's hold completes a deal — the real-world trigger path)
+  // never looked at it. Defaults to OFF — a campaign only renews if the
+  // seller explicitly turned this on (or the column is unexpectedly NULL,
+  // which we also treat as off/false via Number()).
+  const autoRenewOn = !!Number(campaign.auto_renew);
+
+  if (autoRenewOn && stockRows.length && stockRows[0].stock_quantity > 0 && variantStockOk) {
     // Use campaign's own target/prices (set via seller portal); fall back to product table
     const newTarget      = (campaign.target > 0 ? campaign.target : stockRows[0].hold_target) || 0;
     const newHoldPrice   = campaign.hold_price   || null;
     const newRetailPrice = campaign.retail_price || null;
     if (newTarget > 0) {
       await db.query(
-        `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time, hold_price, retail_price, variant_id, variant_label)
-         VALUES (?, ?, ?, 0, 'ACTIVE', NOW(), ?, ?, ?, ?)`,
-        [campaign.product_id, stockRows[0].seller_id, newTarget, newHoldPrice, newRetailPrice, campaign.variant_id || null, campaign.variant_label || null]
+        `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time, hold_price, retail_price, variant_id, variant_label, auto_renew)
+         VALUES (?, ?, ?, 0, 'ACTIVE', NOW(), ?, ?, ?, ?, ?)`,
+        [campaign.product_id, stockRows[0].seller_id, newTarget, newHoldPrice, newRetailPrice, campaign.variant_id || null, campaign.variant_label || null, autoRenewOn ? 1 : 0]
       );
     }
+  } else if (!autoRenewOn) {
+    console.log(`[_completeCampaignAndReset] Campaign ${campaign.id} has auto-renew OFF — skipping renewal`);
   }
 }
