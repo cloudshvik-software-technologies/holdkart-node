@@ -1,10 +1,7 @@
 node_modules/
-  .env
-  uploads/
-  holdkart-node/.env
-  holdkart-node/node_modules/.env
-  node_modules/
-  
+.env
+uploads/
+node_modules/
 *.log
 dist/
 build/
