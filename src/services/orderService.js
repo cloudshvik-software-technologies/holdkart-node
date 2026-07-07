@@ -327,6 +327,26 @@ export const placeOrder = async ({
       await db.query('UPDATE product SET stock_quantity = stock_quantity - ? WHERE id = ?', [item.quantity, p.id]);
     }
 
+    // NEW FEATURE (from teammate's edit): nothing in checkout ever wrote to
+    // the `payment` table, so every admin/seller report that reads platform
+    // commission from it (Finance → Revenue & Profit, Seller → Profit
+    // Report) silently showed zero. There's no commission-rate column
+    // anywhere in the schema yet (not on `seller`, not on `category`), so
+    // this uses one configurable platform-wide default rate (COMMISSION_PCT
+    // env var, falls back to 10%) until a real per-category/per-seller rate
+    // is designed. Uses resolvedPaymentStatus (not the raw client-supplied
+    // paymentMethod) so this row can't be marked "Paid" for an Online order
+    // whose payment was never actually verified — keeping the payment-bypass
+    // security fix intact instead of reverting to the client's say-so.
+    const commissionPct = Number(process.env.COMMISSION_PCT) || 10;
+    const commissionAmt = Math.round(amount * (commissionPct / 100) * 100) / 100;
+    const sellerAmt      = Math.round((amount - commissionAmt) * 100) / 100;
+    await db.query(
+      `INSERT INTO payment (order_id, seller_id, amount, commission, seller_amount, payment_date, payment_status)
+       VALUES (?,?,?,?,?,NOW(),?)`,
+      [r.insertId, p.seller_id, amount, commissionAmt, sellerAmt, resolvedPaymentStatus]
+    );
+
     // Match the campaign for the exact variant being checked out — a product can
     // have several variant-scoped campaigns active at once, so grabbing "any"
     // active campaign here could clear/decrement the wrong one.
@@ -847,10 +867,6 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
 
 /**
  * updateOrderStatus — called by seller panel to update order/delivery status.
- * Sends email notifications for Shipped, Delivered, and Refund Processed.
- */
-/**
- * updateOrderStatus — called by seller panel to update order/delivery status.
  * SECURITY FIX: this had zero ownership check (`WHERE o.id = ?` only) while
  * living on the customer-authenticated router — any logged-in customer
  * could change the order_status/delivery_status/refundAmount of ANY order
@@ -858,6 +874,7 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
  * different orderId. Nothing in the current frontend actually calls this
  * route, but it was still live and exploitable, so it's now scoped to the
  * calling customer's own orders.
+ * Sends email notifications for Shipped, Delivered, and Refund Processed.
  */
 export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, refundAmount, customerId }) => {
   const [rows] = await db.query(
