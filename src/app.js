@@ -41,6 +41,10 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // ── Customer's own uploads (profile images etc.) ──────────────────────────────
+// LEGACY ONLY: new uploads go straight to S3 (see src/config/s3.js) and are
+// served directly from the bucket/CDN. Kept so any image URLs already stored
+// in the DB from before the S3 migration (pointing at '/uploads/...') don't
+// suddenly 404. Safe to remove once no rows reference a local path anymore.
 const uploadsPath = path.join(__dirname, '..', 'uploads');
 fs.mkdirSync(uploadsPath, { recursive: true });
 app.use('/uploads', express.static(uploadsPath));

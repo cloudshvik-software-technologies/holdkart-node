@@ -5,6 +5,9 @@ import { uploadProfileImg } from '../middleware/upload.js';
 
 const r = Router();
 
+/* ── Debug route (no auth) — REMOVE after issue is resolved ───────────────── */
+r.get('/debug', c.debugProfile);
+
 r.use(authenticate);
 r.get('/get',           c.getProfile);
 r.put('/update',        c.updateProfile);

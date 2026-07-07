@@ -6,28 +6,6 @@ import { sendOrderPlacedEmail, sendInvoiceEmail, sendOrderShippedEmail, sendOrde
 
 const genOrderNumber = () => 'HK' + Date.now();
 
-// BUG FIX: product.stock_quantity / reserved_stock are meant to be a cached
-// SUM of all product_variant rows (per productVariantService's own
-// syncProductStockFromVariants on the seller backend) — every screen that
-// shows "in stock" for a variant product reads these two product-level
-// columns rather than summing variants itself. This order flow only ever
-// updated product_variant.stock_quantity directly and never resynced the
-// parent product row, so after any variant order/cancel/return the
-// product-level total silently drifted out of sync with reality (stale,
-// usually too high) until something else happened to trigger a resync.
-const syncProductStockFromVariants = async (productId) => {
-  const [[totals]] = await db.query(
-    `SELECT COALESCE(SUM(stock_quantity),0) AS total,
-            COALESCE(SUM(reserved_stock),0) AS reserved
-     FROM product_variant WHERE product_id = ?`,
-    [productId]
-  );
-  await db.query(
-    `UPDATE product SET stock_quantity = ?, reserved_stock = ? WHERE id = ?`,
-    [totals.total, totals.reserved, productId]
-  );
-};
-
 // The seller dashboard's Notifications page reads from `seller_notification`,
 // but nothing in the order flow was ever writing to it — so sellers never
 // saw Order/Payment alerts there, even though orders/payments were
@@ -139,33 +117,6 @@ export const startInvoiceEmailPoller = () => {
   setInterval(runOnce, 60 * 1000);
 };
 
-// ── One-time migration ──────────────────────────────────────────────────────
-// `orders` never had a way to record which variant (colour/size) a customer
-// checked out with — only `product_id` was stored. So when a completed group
-// deal (tied to e.g. "Green / L" in the cart) was checked out, the variant
-// was silently dropped and the order — and every screen reading it — fell
-// back to the product's default photo/variant (e.g. Blue). This adds a
-// variant_id column (0 = no variant, same convention as `cart` and
-// `campaign_hold`) so orders keep the exact colour/size the customer bought.
-let orderVariantColumnReady = null;
-const ensureOrderVariantColumn = async () => {
-  if (orderVariantColumnReady) return orderVariantColumnReady;
-  orderVariantColumnReady = (async () => {
-    try {
-      const [cols] = await db.query(
-        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'orders' AND COLUMN_NAME = 'variant_id'`
-      );
-      if (!cols.length) {
-        await db.query(`ALTER TABLE orders ADD COLUMN variant_id INT NOT NULL DEFAULT 0 AFTER product_id`);
-      }
-    } catch (e) {
-      console.error('orders variant_id migration check failed:', e.message);
-    }
-  })();
-  return orderVariantColumnReady;
-};
-
 const resolveImage = (raw) => {
   if (!raw) return null;
   let first = raw;
@@ -184,32 +135,6 @@ export const placeOrder = async ({
   deliveryCharge = 0, platformFee = 0, paymentHandlingFee = 0, protectPromiseFee = 0,
 }) => {
   if (!items || !items.length) throw new Error('No items in order');
-  await ensureOrderVariantColumn();
-
-  // SECURITY FIX (critical payment bypass): this previously marked any order
-  // with paymentMethod === 'Online' as payment_status = 'Paid' immediately at
-  // creation, purely on the client's say-so — no payment had to actually
-  // happen. Anyone calling this endpoint directly (skipping the Cashfree
-  // checkout UI entirely) got instant "Paid" orders for free. The frontend
-  // already does the right thing (verifies with Cashfree, then sends the
-  // verified paymentId here — see Checkout.jsx), but the server never
-  // checked it. Now: for an "Online" order, payment is only considered
-  // verified if paymentId is supplied AND a fresh server-to-server check
-  // with Cashfree confirms that order is actually PAID. Anything else
-  // (missing paymentId, failed re-verification) falls back to 'Pending',
-  // exactly like an unpaid COD order — never silently 'Paid'.
-  let verifiedPaid = false;
-  if (paymentMethod === 'Online' && paymentId) {
-    try {
-      verifiedPaid = await paySvc.verifyPayment({ orderId: paymentId });
-    } catch (e) {
-      console.error('[placeOrder] payment re-verification failed:', e.message);
-      verifiedPaid = false;
-    }
-  }
-  const resolvedPaymentStatus = paymentMethod === 'Online'
-    ? (verifiedPaid ? 'Paid' : 'Pending')
-    : 'Pending';
 
   // One common order number for the whole checkout — every product placed
   // together shares this. Each product still gets its own row, distinguished
@@ -222,48 +147,19 @@ export const placeOrder = async ({
     const [prows] = await db.query('SELECT * FROM product WHERE id = ? AND active = true', [item.productId]);
     if (!prows.length) throw Object.assign(new Error(`Product ${item.productId} not found`), { status: 404 });
     const p = prows[0];
-
-    // Match the exact variant the customer is checking out (0 = no variant / base
-    // product), so a product with several DEAL rows in the cart — one per variant —
-    // resolves to the correct price/deposit instead of an arbitrary "LIMIT 1" row.
-    const vId = item.variantId ? Number(item.variantId) : 0;
-
-    // BUG FIX: when the item is a specific variant (colour/size), stock must be
-    // checked/decremented against that variant's own stock_quantity, not the
-    // parent product's. Previously we always checked/decremented
-    // product.stock_quantity, so buying a variant never reduced that variant's
-    // available quantity — it silently drained the (often unused) base
-    // product stock instead, letting a sold-out variant keep showing as
-    // in-stock.
-    let variantRow = null;
-    if (vId) {
-      const [vrows] = await db.query('SELECT * FROM product_variant WHERE id = ? AND product_id = ?', [vId, p.id]);
-      if (!vrows.length) throw Object.assign(new Error(`Variant not found for ${p.product_name}`), { status: 404 });
-      variantRow = vrows[0];
-      if (variantRow.stock_quantity < item.quantity) throw Object.assign(new Error(`Insufficient stock for ${p.product_name}`), { status: 400 });
-    } else {
-      if (p.stock_quantity < item.quantity) throw Object.assign(new Error(`Insufficient stock for ${p.product_name}`), { status: 400 });
-    }
+    if (p.stock_quantity < item.quantity) throw Object.assign(new Error(`Insufficient stock for ${p.product_name}`), { status: 400 });
 
     const [crows] = await db.query('SELECT * FROM customer WHERE id = ?', [customerId]);
     const customer = crows[0];
     subSeq += 1;
     const subOrderNumber = `${orderNumber}-${subSeq}`;
+
     const [cartRow] = await db.query(
-      "SELECT price_type, locked_price, deposit_paid FROM cart WHERE customer_id = ? AND product_id = ? AND variant_id = ? AND price_type = 'DEAL' LIMIT 1",
-      [customerId, item.productId, vId]
+      "SELECT price_type, locked_price, deposit_paid FROM cart WHERE customer_id = ? AND product_id = ? AND price_type = 'DEAL' LIMIT 1",
+      [customerId, item.productId]
     );
     const isDealItem  = cartRow.length > 0;
-    // BUG FIX: for a regular (non-deal) purchase of a specific variant, the
-    // variant's own price_override must win over the base product's
-    // retail_price. Previously this always used p.retail_price regardless of
-    // variant, so e.g. a ₹1000 "Blue / M" variant on a ₹900 base product was
-    // silently charged at ₹900 — undercharging (or overcharging, depending on
-    // the variant) on every regular variant order.
-    const regularPrice = (variantRow && variantRow.price_override != null)
-      ? Number(variantRow.price_override)
-      : Number(p.retail_price);
-    const lockedPrice = isDealItem ? Number(cartRow[0].locked_price) : regularPrice;
+    const lockedPrice = isDealItem ? Number(cartRow[0].locked_price) : Number(p.retail_price);
     const depositPaid = isDealItem ? (Number(cartRow[0].deposit_paid) || 0) : 0;
     const amount      = Math.max(0, lockedPrice * item.quantity - depositPaid);
 
@@ -301,14 +197,14 @@ export const placeOrder = async ({
     } catch {}
 
     const [r] = await db.query(
-      `INSERT INTO orders (order_number, sub_order_number, product_id, variant_id, seller_id, customer_id, quantity, order_amount,
+      `INSERT INTO orders (order_number, sub_order_number, product_id, seller_id, customer_id, quantity, order_amount,
         order_status, order_date, payment_status, delivery_status, address, category,
         product_name, customer_name, created_date, payment_method, customer_email, customer_phone,
         city, pincode, state, delivery_charge, platform_fee, payment_handling_fee, protect_promise_fee,
         customer_courier_id, customer_courier_name)
-       VALUES (?,?,?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [orderNumber, subOrderNumber, p.id, vId, p.seller_id, customerId, item.quantity, amount,
-       resolvedPaymentStatus,
+       VALUES (?,?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [orderNumber, subOrderNumber, p.id, p.seller_id, customerId, item.quantity, amount,
+       paymentMethod === 'Online' ? 'Paid' : 'Pending',
        'Pending', address, p.category, p.product_name,
        customer?.name || '', paymentMethod,
        customer?.email || '', customer?.mobile || '', city, pincode, state,
@@ -320,30 +216,20 @@ export const placeOrder = async ({
        item.courierName || null]
     );
 
-    if (vId) {
-      await db.query('UPDATE product_variant SET stock_quantity = stock_quantity - ? WHERE id = ?', [item.quantity, vId]);
-      await syncProductStockFromVariants(p.id);
-    } else {
-      await db.query('UPDATE product SET stock_quantity = stock_quantity - ? WHERE id = ?', [item.quantity, p.id]);
-    }
+    await db.query('UPDATE product SET stock_quantity = stock_quantity - ? WHERE id = ?', [item.quantity, p.id]);
 
-    // Match the campaign for the exact variant being checked out — a product can
-    // have several variant-scoped campaigns active at once, so grabbing "any"
-    // active campaign here could clear/decrement the wrong one.
     const [activeCampaigns] = await db.query(
-      "SELECT id, variant_id FROM campaign WHERE product_id = ? AND status = 'ACTIVE'",
+      "SELECT id FROM campaign WHERE product_id = ? AND status = 'ACTIVE' LIMIT 1",
       [p.id]
     );
-    const matchedCampaign = activeCampaigns.find(c => vId && Number(c.variant_id) === vId)
-      || activeCampaigns.find(c => !c.variant_id);
-    if (matchedCampaign) {
-      const campaignId = matchedCampaign.id;
+    if (activeCampaigns.length) {
+      const campaignId = activeCampaigns[0].id;
       const [holdRow] = await db.query(
-        'SELECT id FROM campaign_hold WHERE campaign_id = ? AND customer_id = ? AND variant_id = ?',
-        [campaignId, customerId, vId]
+        'SELECT id FROM campaign_hold WHERE campaign_id = ? AND customer_id = ?',
+        [campaignId, customerId]
       );
       if (holdRow.length) {
-        await db.query('DELETE FROM campaign_hold WHERE campaign_id = ? AND customer_id = ? AND variant_id = ?', [campaignId, customerId, vId]);
+        await db.query('DELETE FROM campaign_hold WHERE campaign_id = ? AND customer_id = ?', [campaignId, customerId]);
         await db.query('UPDATE campaign SET current_hold = GREATEST(0, current_hold - 1) WHERE id = ?', [campaignId]);
       }
     }
@@ -558,7 +444,6 @@ export const trackOrder = async (orderId, customerId) => {
 };
 
 export const listOrders = async (customerId) => {
-  await ensureOrderVariantColumn();
   const [rows] = await db.query(
     `SELECT o.*, s.business_name AS "sellerName",
        (SELECT COUNT(*) FROM order_cancel_request ocr
@@ -569,50 +454,35 @@ export const listOrders = async (customerId) => {
         WHERE rv.customer_id = o.customer_id
           AND rv.product_id = o.product_id) AS has_reviewed,
        p.image_url AS product_image_raw,
-       pv.color AS variant_color, pv.size AS variant_size,
-       (SELECT vi.image_url FROM product_variant_image vi
-        WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS variant_image_raw,
        sh.awb_code, sh.tracking_url, sh.label_url
      FROM orders o
      LEFT JOIN seller s ON s.id = o.seller_id
      LEFT JOIN product p ON p.id = o.product_id
-     LEFT JOIN product_variant pv ON pv.id = o.variant_id AND pv.product_id = o.product_id
      LEFT JOIN shipping sh ON sh.order_id = o.id
      WHERE o.customer_id = ? ORDER BY o.created_date DESC`,
     [customerId]
   );
-  // The exact colour/size the customer checked out with (o.variant_id) takes
-  // priority over the product's default photo — a product can be ordered in
-  // several different variants, each with its own image.
   return rows.map(r => ({
     ...r,
-    product_image: resolveImage(r.variant_image_raw) || resolveImage(r.product_image_raw),
+    product_image: resolveImage(r.product_image_raw),
   }));
 };
 
 export const getOrder = async (orderId, customerId) => {
-  await ensureOrderVariantColumn();
   const [rows] = await db.query(
     `SELECT o.*, s.business_name AS "sellerName", s.email AS "sellerEmail",
        p.image_url AS product_image_raw,
-       pv.color AS variant_color, pv.size AS variant_size,
-       (SELECT vi.image_url FROM product_variant_image vi
-        WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS variant_image_raw,
        sh.awb_code, sh.shiprocket_order_id, sh.shiprocket_shipment_id,
        sh.tracking_url, sh.label_url, sh.courier_id
      FROM orders o
      LEFT JOIN seller s ON s.id = o.seller_id
      LEFT JOIN product p ON p.id = o.product_id
-     LEFT JOIN product_variant pv ON pv.id = o.variant_id AND pv.product_id = o.product_id
      LEFT JOIN shipping sh ON sh.order_id = o.id
      WHERE o.id = ? AND o.customer_id = ?`,
     [orderId, customerId]
   );
   if (!rows[0]) return null;
-  const order = {
-    ...rows[0],
-    product_image: resolveImage(rows[0].variant_image_raw) || resolveImage(rows[0].product_image_raw),
-  };
+  const order = { ...rows[0], product_image: resolveImage(rows[0].product_image_raw) };
 
   if (order.order_status === 'Delivered') {
     await markDeliveredAndSendEmail(order, order.customer_email);
@@ -692,20 +562,11 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
         [orderId, customerId, order.seller_id, cancellation_reason || null, resType]
       );
 
-      // Restore stock (BUG FIX: restore to the specific variant if this
-      // order was for one, instead of always crediting the base product)
-      if (order.variant_id) {
-        await db.query(
-          'UPDATE product_variant SET stock_quantity = stock_quantity + ? WHERE id = ?',
-          [order.quantity || 1, order.variant_id]
-        );
-        await syncProductStockFromVariants(order.product_id);
-      } else {
-        await db.query(
-          'UPDATE product SET stock_quantity = stock_quantity + ? WHERE id = ?',
-          [order.quantity || 1, order.product_id]
-        );
-      }
+      // Restore stock
+      await db.query(
+        'UPDATE product SET stock_quantity = stock_quantity + ? WHERE id = ?',
+        [order.quantity || 1, order.product_id]
+      );
 
       // Send refund email
       try {
@@ -755,20 +616,11 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
         [orderId, customerId, order.seller_id, cancellation_reason || null, 'Refund']
       );
 
-      // Restore stock (BUG FIX: restore to the specific variant if this
-      // order was for one, instead of always crediting the base product)
-      if (order.variant_id) {
-        await db.query(
-          'UPDATE product_variant SET stock_quantity = stock_quantity + ? WHERE id = ?',
-          [order.quantity || 1, order.variant_id]
-        );
-        await syncProductStockFromVariants(order.product_id);
-      } else {
-        await db.query(
-          'UPDATE product SET stock_quantity = stock_quantity + ? WHERE id = ?',
-          [order.quantity || 1, order.product_id]
-        );
-      }
+      // Restore stock
+      await db.query(
+        'UPDATE product SET stock_quantity = stock_quantity + ? WHERE id = ?',
+        [order.quantity || 1, order.product_id]
+      );
 
       await db.query(
         'INSERT INTO customer_notification (customer_id, title, message, type) VALUES (?,?,?,?)',
@@ -849,17 +701,7 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
  * updateOrderStatus — called by seller panel to update order/delivery status.
  * Sends email notifications for Shipped, Delivered, and Refund Processed.
  */
-/**
- * updateOrderStatus — called by seller panel to update order/delivery status.
- * SECURITY FIX: this had zero ownership check (`WHERE o.id = ?` only) while
- * living on the customer-authenticated router — any logged-in customer
- * could change the order_status/delivery_status/refundAmount of ANY order
- * in the system, not just their own, just by hitting this endpoint with a
- * different orderId. Nothing in the current frontend actually calls this
- * route, but it was still live and exploitable, so it's now scoped to the
- * calling customer's own orders.
- */
-export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, refundAmount, customerId }) => {
+export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, refundAmount }) => {
   const [rows] = await db.query(
     `SELECT o.*, c.name AS "customerName", c.email AS "customerEmail",
             sh.awb_code, sh.tracking_url
@@ -871,12 +713,6 @@ export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, 
   );
   if (!rows.length) { const e = new Error('Order not found'); e.status = 404; throw e; }
   const order = rows[0];
-
-  if (customerId != null && String(order.customer_id) !== String(customerId)) {
-    const e = new Error('You do not have permission to update this order');
-    e.status = 403;
-    throw e;
-  }
 
   const updateFields = [];
   const updateValues = [];

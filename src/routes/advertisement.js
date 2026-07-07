@@ -74,4 +74,17 @@ router.get('/active', async (req, res) => {
   }
 });
 
+// GET /api/customer/ads/debug — all ads, no filters
+router.get('/debug', async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT id, ad_type, status, payment_status, start_date, end_date, image_url
+       FROM seller_advertisement ORDER BY id DESC LIMIT 20`
+    );
+    res.json({ success: true, count: rows.length, rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 export default router;
