@@ -14,8 +14,10 @@ const buildPayload = (c) => ({ id: c.id, name: c.name, email: c.email });
 let _colCache = null;
 async function getCustomerCols() {
   if (_colCache) return _colCache;
-  const [rows] = await db.query('SHOW COLUMNS FROM customer');
-  _colCache = new Set(rows.map(r => r.Field));
+  const [rows] = await db.query(
+    "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'customer'"
+  );
+  _colCache = new Set(rows.map(r => r.column_name));
   return _colCache;
 }
 
