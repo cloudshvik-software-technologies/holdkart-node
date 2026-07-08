@@ -8,7 +8,8 @@ const parseImages = (raw) => {
 
 export const addToWishlist = async ({ customerId, productId }) => {
   await db.query(
-    'INSERT INTO wishlist (customer_id, product_id) VALUES (?, ?) ON CONFLICT DO NOTHING',
+    `INSERT INTO wishlist (customer_id, product_id) VALUES (?, ?)
+     ON CONFLICT (customer_id, product_id) DO NOTHING`,
     [customerId, productId]
   );
   return { message: 'Added to wishlist' };

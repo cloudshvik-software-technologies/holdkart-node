@@ -32,10 +32,9 @@ export const addReview = async ({ customerId, productId, rating, comment, imageP
   const [result] = await db.query(
     `INSERT INTO review (customer_id, product_id, order_id, rating, comment)
      VALUES (?,?,?,?,?)
-     ON CONFLICT (customer_id, product_id) DO UPDATE SET
+     ON CONFLICT (customer_id, product_id, order_id) DO UPDATE SET
        rating   = EXCLUDED.rating,
-       comment  = EXCLUDED.comment,
-       order_id = EXCLUDED.order_id`,
+       comment  = EXCLUDED.comment`,
     [customerId, productId, orderId, rating, comment || '']
   );
 

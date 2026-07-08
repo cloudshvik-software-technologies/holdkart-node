@@ -7,7 +7,7 @@
 // product detail page can offer a colour/size selector with per-variant
 // pricing and stock, the same way the seller already sees it.
 //
-// Live DB columns (shared Postgres instance):
+// Live DB columns (shared MySQL instance):
 //   product_variant:
 //     id, product_id, sku, color, size, price_override, stock_quantity,
 //     reserved_stock, min_stock_level, active, created_at

@@ -16,8 +16,8 @@
 // app itself), or edit the pool config below directly.
 
 import 'dotenv/config';
-import mysql from 'mysql2/promise';
 import bcrypt from 'bcryptjs';
+import db from './config/db.js';
 
 const BCRYPT_ROUNDS = 10; // must match authService.js
 
@@ -33,15 +33,8 @@ async function main() {
     process.exit(1);
   }
 
-  const pool = mysql.createPool({
-    host:     process.env.DB_HOST     || 'localhost',
-    user:     process.env.DB_USER     || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME     || 'holdkart',
-  });
-
   try {
-    const [existing] = await pool.query(
+    const [existing] = await db.query(
       'SELECT id, name, email FROM customer WHERE email = ?',
       [email]
     );
@@ -52,7 +45,7 @@ async function main() {
 
     const hash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
 
-    const [result] = await pool.query(
+    const [result] = await db.query(
       'UPDATE customer SET password = ? WHERE email = ?',
       [hash, email]
     );
@@ -63,12 +56,12 @@ async function main() {
 
       // Optional: invalidate any pending reset tokens for this email so an
       // old token can't also be used to change it again.
-      await pool.query('DELETE FROM customer_password_reset_token WHERE email = ?', [email]);
+      await db.query('DELETE FROM customer_password_reset_token WHERE email = ?', [email]);
     } else {
       console.error('Update did not affect any rows — nothing changed.');
     }
   } finally {
-    await pool.end();
+    await db.pool.end();
   }
 }
 
