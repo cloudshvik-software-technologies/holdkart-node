@@ -1,5 +1,6 @@
 import * as svc from '../services/profileService.js';
 import db from '../config/db.js';
+import { uploadBufferToS3, buildKey } from '../config/s3.js';
 
 export const getProfile = async (req, res) => {
   try {
@@ -29,10 +30,16 @@ export const updateProfile = async (req, res) => {
 export const uploadProfileImage = async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file provided' });
-    res.json(await svc.uploadProfileImage({
-      customerId: req.customer.id,
-      imageUrl:   '/uploads/profiles/' + req.file.filename,
-    }));
+
+    const customerId = req.customer.id;
+    const key = buildKey('profile-images', customerId, req.file.originalname);
+    const imageUrl = await uploadBufferToS3({
+      buffer: req.file.buffer,
+      key,
+      contentType: req.file.mimetype,
+    });
+
+    res.json(await svc.uploadProfileImage({ customerId, imageUrl }));
   } catch (e) {
     console.error('[profileController.uploadProfileImage] ERROR:', e.message);
     res.status(500).json({ message: e.message });

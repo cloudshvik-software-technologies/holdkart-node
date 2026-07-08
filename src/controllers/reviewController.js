@@ -1,4 +1,5 @@
 import * as svc from '../services/reviewService.js';
+import { uploadBufferToS3, buildKey } from '../config/s3.js';
 
 export const checkCanReview = async (req, res) => {
   try {
@@ -12,11 +13,20 @@ export const checkCanReview = async (req, res) => {
 
 export const addReview = async (req, res) => {
   try {
-    // req.files comes from multer (array of uploaded review images)
-    const imagePaths = (req.files || []).map(f => `/uploads/reviews/${f.filename}`);
     const { productId, rating, comment } = req.body;
+    const customerId = req.customer.id;
+
+    // req.files comes from multer (array of uploaded review images, in memory)
+    const entityId = `${productId}/${customerId}`;
+    const imagePaths = await Promise.all(
+      (req.files || []).map(async (f) => {
+        const key = buildKey('review-images', entityId, f.originalname);
+        return uploadBufferToS3({ buffer: f.buffer, key, contentType: f.mimetype });
+      })
+    );
+
     await svc.addReview({
-      customerId: req.customer.id,
+      customerId,
       productId,
       rating: Number(rating),
       comment,
