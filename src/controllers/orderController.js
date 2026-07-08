@@ -6,4 +6,4 @@ import * as svc from '../services/orderService.js';
   export const cancelOrder = async (req, res) => { try { res.json(await svc.cancelOrder({ ...req.body, customerId: req.customer.id })); } catch(e) { res.status(s(e)).json({ message: e.message }); } };
   export const returnOrder = async (req, res) => { try { res.json(await svc.returnOrder({ ...req.body, customerId: req.customer.id })); } catch(e) { res.status(s(e)).json({ message: e.message }); } };
   export const trackOrder  = async (req, res) => { try { res.json(await svc.trackOrder(req.params.orderId, req.customer.id)); } catch(e) { res.status(s(e)).json({ message: e.message }); } };
-  export const updateOrderStatus = async (req, res) => { try { res.json(await svc.updateOrderStatus({ orderId: req.params.orderId, ...req.body })); } catch(e) { res.status(s(e)).json({ message: e.message }); } };
+ export const updateOrderStatus = async (req, res) => { try { res.json(await svc.updateOrderStatus({ orderId: req.params.orderId, ...req.body, customerId: req.customer.id })); } catch(e) { res.status(s(e)).json({ message: e.message }); } };

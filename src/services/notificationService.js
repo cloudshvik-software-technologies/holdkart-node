@@ -21,4 +21,3 @@ import db from '../config/db.js';
     const [rows] = await db.query('SELECT COUNT(*) AS cnt FROM customer_notification WHERE customer_id=? AND is_read=false', [customerId]);
     return { count: rows[0].cnt };
   };
-  

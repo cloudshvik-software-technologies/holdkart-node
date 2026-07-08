@@ -1,6 +1,5 @@
 import * as svc from '../services/profileService.js';
 import db from '../config/db.js';
-import { uploadBufferToS3, buildKey } from '../config/s3.js';
 
 export const getProfile = async (req, res) => {
   try {
@@ -30,16 +29,10 @@ export const updateProfile = async (req, res) => {
 export const uploadProfileImage = async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file provided' });
-
-    const customerId = req.customer.id;
-    const key = buildKey('profile-images', customerId, req.file.originalname);
-    const imageUrl = await uploadBufferToS3({
-      buffer: req.file.buffer,
-      key,
-      contentType: req.file.mimetype,
-    });
-
-    res.json(await svc.uploadProfileImage({ customerId, imageUrl }));
+    res.json(await svc.uploadProfileImage({
+      customerId: req.customer.id,
+      imageUrl:   '/uploads/profiles/' + req.file.filename,
+    }));
   } catch (e) {
     console.error('[profileController.uploadProfileImage] ERROR:', e.message);
     res.status(500).json({ message: e.message });
@@ -109,10 +102,8 @@ export const debugProfile = async (_req, res) => {
     results.db_connection = 'FAILED: ' + e.message;
   }
   try {
-    const [rows] = await db.query(
-      "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'customer'"
-    );
-    results.customer_columns = rows.map(r => r.column_name);
+    const [rows] = await db.query(`SELECT column_name AS "Field" FROM information_schema.columns WHERE table_name = 'customer'`);
+    results.customer_columns = rows.map(r => r.Field);
   } catch (e) {
     results.customer_columns = 'FAILED: ' + e.message;
   }

@@ -8,10 +8,8 @@ let _colCache = null;
 
 async function getCols() {
   if (_colCache) return _colCache;
-  const [rows] = await db.query(
-    "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'customer'"
-  );
-  _colCache = new Set(rows.map(r => r.column_name));
+  const [rows] = await db.query(`SELECT column_name AS "Field" FROM information_schema.columns WHERE table_name = 'customer'`);
+  _colCache = new Set(rows.map(r => r.Field));
   return _colCache;
 }
 
@@ -83,7 +81,7 @@ async function ensureDeactivationCols() {
     invalidateColCache();
   }
   if (!cols.has('deactivation_reason')) {
-    await db.query('ALTER TABLE customer ADD COLUMN deactivation_reason TEXT NULL');
+    await db.query('ALTER TABLE customer ADD COLUMN IF NOT EXISTS deactivation_reason TEXT NULL');
     invalidateColCache();
   }
 }
