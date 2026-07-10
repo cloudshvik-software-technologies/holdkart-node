@@ -128,9 +128,9 @@ export const getProduct = async (productId) => {
      EXISTS (
        SELECT 1 FROM campaign c3 WHERE c3.product_id = p.id AND c3.status = 'ACTIVE'
      ) AS has_campaign,
-     (SELECT c4.hold_price FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' AND c4.hold_price > 0 LIMIT 1) AS campaign_hold_price,
-     (SELECT c4.target FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' AND c4.target > 0 LIMIT 1) AS campaign_hold_target,
-     (SELECT c4.retail_price FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' LIMIT 1) AS campaign_retail_price
+     (SELECT c4.hold_price FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' AND c4.hold_price > 0 ORDER BY c4.current_hold DESC, c4.id ASC LIMIT 1) AS campaign_hold_price,
+     (SELECT c4.target FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' AND c4.target > 0 ORDER BY c4.current_hold DESC, c4.id ASC LIMIT 1) AS campaign_hold_target,
+     (SELECT c4.retail_price FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' ORDER BY c4.current_hold DESC, c4.id ASC LIMIT 1) AS campaign_retail_price
      FROM product p
      LEFT JOIN seller s ON s.id = p.seller_id
      LEFT JOIN review r ON r.product_id = p.id
