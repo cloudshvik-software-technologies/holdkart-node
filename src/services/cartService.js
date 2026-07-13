@@ -111,7 +111,6 @@ export const addToCart = async ({ customerId, productId, variantId, quantity = 1
 };
 
 export const getCart = async (customerId) => {
-  await ensureVariantColumn();
   const [rows] = await db.query(
     `SELECT
        c.id             AS "cartId",
