@@ -1,5 +1,35 @@
 import * as svc from '../services/profileService.js';
 import db from '../config/db.js';
+import { uploadBufferToS3, buildKey, deleteFromS3 } from '../config/s3.js';
+import env from '../config/env.js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { randomUUID } from 'crypto';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// S3 is only usable when real credentials + a bucket are configured. Locally
+// (no AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / S3_BUCKET_NAME in .env),
+// every S3 call fails, so profile photo uploads fall back to writing the
+// buffer to the same local /uploads folder app.js already serves statically
+// — this only affects this dev fallback path, production S3 behaviour is
+// unchanged once real credentials are present.
+const s3Configured = Boolean(env.s3.accessKeyId && env.s3.secretAccessKey && env.s3.bucket);
+
+const saveBufferLocally = (buffer, originalname) => {
+  const ext = (originalname.match(/\.[a-zA-Z0-9]+$/) || [''])[0].toLowerCase();
+  const dir = path.join(__dirname, '..', '..', 'uploads', 'profiles');
+  fs.mkdirSync(dir, { recursive: true });
+  const filename = `${randomUUID()}${ext}`;
+  fs.writeFileSync(path.join(dir, filename), buffer);
+  return `/uploads/profiles/${filename}`;
+};
+
+const deleteLocalFile = (urlOrKey) => {
+  if (!urlOrKey?.startsWith('/uploads/')) return;
+  try { fs.unlinkSync(path.join(__dirname, '..', '..', urlOrKey)); } catch { /* already gone */ }
+};
 
 export const getProfile = async (req, res) => {
   try {
@@ -29,10 +59,19 @@ export const updateProfile = async (req, res) => {
 export const uploadProfileImage = async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file provided' });
-    res.json(await svc.uploadProfileImage({
-      customerId: req.customer.id,
-      imageUrl:   '/uploads/profiles/' + req.file.filename,
-    }));
+    const customerId = req.customer.id;
+    let imageUrl;
+    if (s3Configured) {
+      const key = buildKey('profile-images', customerId, req.file.originalname);
+      imageUrl = await uploadBufferToS3({
+        buffer:      req.file.buffer,
+        key,
+        contentType: req.file.mimetype,
+      });
+    } else {
+      imageUrl = saveBufferLocally(req.file.buffer, req.file.originalname);
+    }
+    res.json(await svc.uploadProfileImage({ customerId, imageUrl }));
   } catch (e) {
     console.error('[profileController.uploadProfileImage] ERROR:', e.message);
     res.status(500).json({ message: e.message });
@@ -41,7 +80,13 @@ export const uploadProfileImage = async (req, res) => {
 
 export const deleteProfileImage = async (req, res) => {
   try {
-    res.json(await svc.deleteProfileImage({ customerId: req.customer.id }));
+    const customerId = req.customer.id;
+    const current = await svc.getProfile(customerId);
+    if (current?.profile_image) {
+      if (current.profile_image.startsWith('/uploads/')) deleteLocalFile(current.profile_image);
+      else await deleteFromS3(current.profile_image);
+    }
+    res.json(await svc.deleteProfileImage({ customerId }));
   } catch (e) {
     console.error('[profileController.deleteProfileImage] ERROR:', e.message);
     res.status(500).json({ message: e.message });

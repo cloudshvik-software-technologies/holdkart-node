@@ -72,11 +72,12 @@ export const listCampaigns = async () => {
   return rows;
 };
 
-export const joinCampaign = async ({ customerId, campaignId, quantity = 1 }) => {
+export const joinCampaign = async ({ customerId, campaignId, quantity = 1, cashfreeOrderId = null, depositAmount = null }) => {
   quantity = Math.max(1, parseInt(quantity, 10) || 1);
 
   const [rows] = await db.query(
-    `SELECT c.* FROM campaign c
+    `SELECT c.*, p.retail_price AS product_retail_price, p.hold_price AS product_hold_price, p.product_name
+     FROM campaign c
      JOIN product p ON p.id = c.product_id AND p.active = true
      WHERE c.id = ? AND c.status = 'ACTIVE'`,
     [campaignId]
@@ -107,10 +108,38 @@ export const joinCampaign = async ({ customerId, campaignId, quantity = 1 }) => 
     await _completeCampaignAndReset(updated[0]);
   }
 
+  // Record the advance/deposit amount — this endpoint previously joined the
+  // customer to the campaign without collecting or recording any deposit at
+  // all, unlike startOrJoinCampaign/addToDeal. Mirror that same logic here
+  // so a join from the campaign detail page (/campaigns/:id) also charges
+  // and records the advance amount, using the actual amount paid by the
+  // frontend and falling back to the calculated per-unit deposit.
+  try {
+    const retailPrice    = Number(c.retail_price || c.product_retail_price || 0);
+    const holdPrice      = Number(c.hold_price   || c.product_hold_price   || 0);
+    const depositPerUnit = Math.max(0, retailPrice - holdPrice);
+    const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+    if (totalDeposit > 0) {
+      await txSvc.record({
+        customerId,
+        orderId:         null,
+        orderNumber:     null,
+        amount:          totalDeposit,
+        type:            'DEAL_DEPOSIT',
+        method:          'Online',
+        status:          'SUCCESS',
+        description:     `Deal deposit for "${c.product_name}" x${quantity} (Campaign #${campaignId})`,
+        cashfreeOrderId: cashfreeOrderId,
+      });
+    }
+  } catch (txErr) {
+    console.error('[campaignService] joinCampaign deposit record error:', txErr.message);
+  }
+
   return { message: 'You have joined the hold campaign!' };
 };
 
-export const leaveCampaign = async ({ customerId, campaignId }) => {
+export const leaveCampaign = async ({ customerId, campaignId, quantity }) => {
   const [rows] = await db.query("SELECT * FROM campaign WHERE id = ? AND status IN ('ACTIVE', 'PAUSED')", [campaignId]);
   if (!rows.length) { const e = new Error('Cannot leave a completed or inactive campaign'); e.status = 400; throw e; }
 
@@ -127,17 +156,35 @@ export const leaveCampaign = async ({ customerId, campaignId }) => {
   );
   const slotCount = countRows[0]?.cnt || 1;
 
-  await db.query(
-    'DELETE FROM campaign_hold WHERE campaign_id = ? AND customer_id = ?',
-    [campaignId, customerId]
+  // How many of the customer's own joined slots to release. Defaults to
+  // "leave everything" when no quantity is given (kept for backward
+  // compatibility with any existing callers), otherwise clamp to 1..slotCount
+  // so a customer can never remove more slots than they actually hold.
+  let qty = quantity == null ? slotCount : parseInt(quantity, 10);
+  if (!Number.isFinite(qty) || qty < 1) qty = 1;
+  if (qty > slotCount) qty = slotCount;
+
+  const [idRows] = await db.query(
+    'SELECT id FROM campaign_hold WHERE campaign_id = ? AND customer_id = ? ORDER BY id LIMIT ?',
+    [campaignId, customerId, qty]
   );
+  const ids = idRows.map(r => r.id);
+  if (ids.length) {
+    await db.query(`DELETE FROM campaign_hold WHERE id IN (${ids.map(() => '?').join(',')})`, ids);
+  }
 
   await db.query(
     'UPDATE campaign SET current_hold = GREATEST(0, current_hold - ?) WHERE id = ?',
-    [slotCount, campaignId]
+    [qty, campaignId]
   );
 
-  return { message: 'You have left the campaign' };
+  const remaining = slotCount - qty;
+  return {
+    message: remaining > 0
+      ? `You left the deal for ${qty} ${qty === 1 ? 'unit' : 'units'}. You still have ${remaining} ${remaining === 1 ? 'unit' : 'units'} in this deal.`
+      : 'You have left the campaign',
+    remainingQuantity: remaining,
+  };
 };
 
 /**
