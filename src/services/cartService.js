@@ -22,53 +22,14 @@ const parseSpecs = (raw) => {
 // include it, so each distinct product+variant combination gets its own
 // cart row. Runs lazily on first use; checks INFORMATION_SCHEMA first so
 // it's a no-op once already applied.
-let variantColumnReady = null;
-const ensureVariantColumn = async () => {
-  if (variantColumnReady) return variantColumnReady;
-  variantColumnReady = (async () => {
-    try {
-      const [cols] = await db.query(
-        `SELECT column_name FROM information_schema.columns
-         WHERE table_schema = current_schema() AND table_name = 'cart' AND column_name = 'variant_id'`
-      );
-      if (!cols.length) {
-        await db.query(`ALTER TABLE cart ADD COLUMN variant_id INT NOT NULL DEFAULT 0`);
-      }
-
-      // Find any unique constraint covering (customer_id, product_id, price_type)
-      // that does NOT already include variant_id, and widen it — otherwise
-      // inserting a second variant for the same product still collides
-      // against the old constraint.
-      const [rows] = await db.query(
-        `SELECT tc.constraint_name AS "INDEX_NAME",
-                STRING_AGG(kcu.column_name, ',' ORDER BY kcu.ordinal_position) AS cols
-         FROM information_schema.table_constraints tc
-         JOIN information_schema.key_column_usage kcu
-           ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-         WHERE tc.table_schema = current_schema() AND tc.table_name = 'cart'
-           AND tc.constraint_type = 'UNIQUE'
-         GROUP BY tc.constraint_name`
-      );
-      const staleKey = rows.find(r => {
-        const c = (r.cols || '').split(',');
-        return c.includes('customer_id') && c.includes('product_id') && c.includes('price_type') && !c.includes('variant_id');
-      });
-      if (staleKey) {
-        await db.query(`ALTER TABLE cart DROP CONSTRAINT "${staleKey.INDEX_NAME}"`);
-        await db.query(`ALTER TABLE cart ADD CONSTRAINT uniq_cart_item UNIQUE (customer_id, product_id, variant_id, price_type)`);
-      }
-    } catch (e) {
-      // Non-fatal — if this partially applied before, later calls just find
-      // things already in place. Cart still works even if this fails, it
-      // just won't yet distinguish variants.
-      console.error('Cart variant_id migration check failed:', e.message);
-    }
-  })();
-  return variantColumnReady;
-};
+// NOTE: this used to be a MySQL-only self-migration (checking
+// INFORMATION_SCHEMA.STATISTICS, widening a unique key at runtime) that ran
+// the first time addToCart was called. On Postgres, the `cart` table is
+// created directly from schema.sql with `variant_id` and the correct
+// `cart_uniq_cart_item (customer_id, product_id, variant_id, price_type)`
+// unique constraint already in place, so this step is no longer needed.
 
 export const addToCart = async ({ customerId, productId, variantId, quantity = 1 }) => {
-  await ensureVariantColumn();
   const vId = variantId ? Number(variantId) : 0;
 
   let remainingStock;
@@ -150,7 +111,6 @@ export const addToCart = async ({ customerId, productId, variantId, quantity = 1
 };
 
 export const getCart = async (customerId) => {
-  await ensureVariantColumn();
   const [rows] = await db.query(
     `SELECT
        c.id             AS "cartId",
@@ -270,7 +230,9 @@ export const removeFromCart = async ({ customerId, cartId }) => {
       cancelled_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_ccd_customer ON customer_cancelled_deal (customer_id)`);
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_ccd_customer ON customer_cancelled_deal (customer_id)
+  `);
 
   // Fetch the cart row first so we know the price_type and product
   const [rows] = await db.query(

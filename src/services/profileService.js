@@ -2,16 +2,14 @@ import db from '../config/db.js';
 import bcrypt from 'bcryptjs';
 
 /* Columns that might or might not exist */
-const ALL_OPTIONAL_COLS = ['mobile', 'phone', 'address', 'city', 'state', 'pincode', 'profile_image', 'active', 'created_date'];
+const ALL_OPTIONAL_COLS = ['mobile', 'phone', 'address', 'city', 'state', 'pincode', 'profile_image', 'gender', 'active', 'created_date'];
 
 let _colCache = null;
 
 async function getCols() {
   if (_colCache) return _colCache;
-  const [rows] = await db.query(
-    "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'customer'"
-  );
-  _colCache = new Set(rows.map(r => r.column_name));
+  const [rows] = await db.query(`SELECT column_name AS "Field" FROM information_schema.columns WHERE table_name = 'customer'`);
+  _colCache = new Set(rows.map(r => r.Field));
   return _colCache;
 }
 
@@ -31,8 +29,16 @@ export const getProfile = async (customerId) => {
   return rows[0] || null;
 };
 
-export const updateProfile = async ({ customerId, name, mobile, address, city, state, pincode }) => {
-  const cols = await getCols();
+export const updateProfile = async ({ customerId, name, mobile, address, city, state, pincode, gender }) => {
+  let cols = await getCols();
+
+  // Older databases won't have this column yet — add it lazily, same pattern
+  // used for profile_image above.
+  if (!cols.has('gender')) {
+    await db.query('ALTER TABLE customer ADD COLUMN IF NOT EXISTS gender TEXT');
+    invalidateColCache();
+    cols = await getCols();
+  }
 
   const setClauses = ['name = ?'];
   const values     = [name];
@@ -44,6 +50,7 @@ export const updateProfile = async ({ customerId, name, mobile, address, city, s
   if (cols.has('city'))    { setClauses.push('city = ?');    values.push(city    || null); }
   if (cols.has('state'))   { setClauses.push('state = ?');   values.push(state   || null); }
   if (cols.has('pincode')) { setClauses.push('pincode = ?'); values.push(pincode || null); }
+  if (cols.has('gender'))  { setClauses.push('gender = ?');  values.push(gender  || null); }
 
   values.push(customerId);
   await db.query(`UPDATE customer SET ${setClauses.join(', ')} WHERE id = ?`, values);
@@ -83,7 +90,7 @@ async function ensureDeactivationCols() {
     invalidateColCache();
   }
   if (!cols.has('deactivation_reason')) {
-    await db.query('ALTER TABLE customer ADD COLUMN deactivation_reason TEXT NULL');
+    await db.query('ALTER TABLE customer ADD COLUMN IF NOT EXISTS deactivation_reason TEXT NULL');
     invalidateColCache();
   }
 }

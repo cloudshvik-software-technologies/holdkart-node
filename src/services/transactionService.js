@@ -20,8 +20,8 @@ export const ensureTable = async () => {
       created_at     TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_customer_txn_customer ON customer_transaction (customer_id)`);
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_customer_txn_order ON customer_transaction (order_id)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_customer ON customer_transaction (customer_id)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_order ON customer_transaction (order_id)`);
 };
 
 /**

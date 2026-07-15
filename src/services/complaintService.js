@@ -29,14 +29,15 @@ const resolveImage = (raw) => {
         resolved_date       TIMESTAMP    DEFAULT NULL
       )
     `);
-    await db.query(`CREATE INDEX IF NOT EXISTS idx_customer ON customer_complaint (customer_id)`);
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_customer ON customer_complaint (customer_id)
+    `);
   } catch (e) {
     console.error('[complaintService] table init error:', e.message);
   }
 
   // Backfill the link column for tables created before this change.
-  // Postgres supports ADD COLUMN IF NOT EXISTS directly, so no error-code
-  // dance is needed here (that was a MySQL-version workaround).
+  // IF NOT EXISTS makes this safe to call every time.
   try {
     await db.query(`
       ALTER TABLE customer_complaint

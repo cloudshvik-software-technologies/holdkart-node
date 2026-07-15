@@ -18,10 +18,24 @@ const toProduct = (p) => {
   const stock          = Number(p.stock_quantity) || 0;
   const remainingStock = Math.max(0, stock - currentHold);
   const hasCampaign    = Number(p.has_campaign) === 1;
+  // A product can have several ACTIVE campaigns running at once, each scoped to a
+  // different colour/size variant (e.g. "Green / L" is on deal while "Blue / L" is
+  // not). PRODUCT_SELECT below picks ONE representative campaign per product — the
+  // one closest to its target (most joined) — via the campaign_variant_* columns.
+  // When that representative campaign is scoped to a specific variant, surface its
+  // own photo/price instead of always falling back to the base product's default,
+  // and flag how many OTHER variants also have a deal running so the listing can
+  // show a "+N more variants on deal" indicator.
+  const campaignVariantId = p.campaign_variant_id != null ? Number(p.campaign_variant_id) : null;
+  const campaignVariantImage = p.campaign_variant_image || null;
+  const otherVariantDealsCount = Math.max(
+    0,
+    (Number(p.active_variant_campaign_count) || 0) - (campaignVariantId ? 1 : 0)
+  );
   return {
     productId: p.id, sellerId: p.seller_id, sellerName: p.seller_name || null,
     name: p.product_name, description: p.description, category: p.category,
-    imageUrl: images[0] || null, images,
+    imageUrl: campaignVariantImage || images[0] || null, images,
     retailPrice: Number(p.campaign_retail_price) || p.retail_price,
     // Only expose group-deal pricing/target when the product actually has an ACTIVE campaign.
     // Without this gate, products fall back to their static product.hold_price/hold_target
@@ -29,8 +43,15 @@ const toProduct = (p) => {
     // even when no campaign is running.
     holdPrice:   hasCampaign ? (Number(p.campaign_hold_price)  || p.hold_price) : null,
     holdTarget:  hasCampaign ? (Number(p.campaign_hold_target) || p.hold_target) : 0,
-    currentHold,
+    currentHold: hasCampaign && p.campaign_current_hold != null ? Number(p.campaign_current_hold) : currentHold,
     hasCampaign,
+    // Which specific variant the displayed deal price/image belongs to (null = whole-product deal)
+    campaignVariantId,
+    campaignVariantLabel: p.campaign_variant_label || null,
+    campaignVariantColor: p.campaign_variant_color || null,
+    campaignVariantSize:  p.campaign_variant_size  || null,
+    // How many additional variants (besides the one shown) also have an active deal
+    otherVariantDealsCount,
     stock, remainingStock, active: Boolean(p.active),
     hasVariants: Boolean(p.has_variants),
     warehouseLocation: p.warehouse_location,
@@ -38,6 +59,15 @@ const toProduct = (p) => {
     specs: parseSpecs(p.specs),
   };
 };
+
+// Picks the single "best" active campaign to represent a product in list views —
+// the one closest to completion (highest current_hold) — since a product can run
+// several variant-scoped campaigns simultaneously and a listing card can only show one.
+const BEST_CAMPAIGN_ID = `(
+  SELECT c5.id FROM campaign c5
+  WHERE c5.product_id = p.id AND c5.status = 'ACTIVE' AND (c5.end_time IS NULL OR c5.end_time > NOW())
+  ORDER BY c5.current_hold DESC, c5.id ASC LIMIT 1
+)`;
 
 // Shared campaign-aware SELECT fragment reused across all queries
 const PRODUCT_SELECT = `SELECT p.*,
@@ -50,9 +80,22 @@ const PRODUCT_SELECT = `SELECT p.*,
   EXISTS (
     SELECT 1 FROM campaign c3 WHERE c3.product_id = p.id AND c3.status = 'ACTIVE'
   ) AS has_campaign,
-  (SELECT c4.hold_price   FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' AND c4.hold_price > 0 LIMIT 1) AS campaign_hold_price,
-  (SELECT c4.target       FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' AND c4.target > 0 LIMIT 1) AS campaign_hold_target,
-  (SELECT c4.retail_price FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' LIMIT 1) AS campaign_retail_price
+  (SELECT c6.hold_price     FROM campaign c6 WHERE c6.id = ${BEST_CAMPAIGN_ID}) AS campaign_hold_price,
+  (SELECT c6.target         FROM campaign c6 WHERE c6.id = ${BEST_CAMPAIGN_ID}) AS campaign_hold_target,
+  (SELECT c6.retail_price   FROM campaign c6 WHERE c6.id = ${BEST_CAMPAIGN_ID}) AS campaign_retail_price,
+  (SELECT c6.current_hold   FROM campaign c6 WHERE c6.id = ${BEST_CAMPAIGN_ID}) AS campaign_current_hold,
+  (SELECT c6.variant_id     FROM campaign c6 WHERE c6.id = ${BEST_CAMPAIGN_ID}) AS campaign_variant_id,
+  (SELECT c6.variant_label  FROM campaign c6 WHERE c6.id = ${BEST_CAMPAIGN_ID}) AS campaign_variant_label,
+  (SELECT pv6.color FROM product_variant pv6
+   WHERE pv6.id = (SELECT c6.variant_id FROM campaign c6 WHERE c6.id = ${BEST_CAMPAIGN_ID})) AS campaign_variant_color,
+  (SELECT pv6.size FROM product_variant pv6
+   WHERE pv6.id = (SELECT c6.variant_id FROM campaign c6 WHERE c6.id = ${BEST_CAMPAIGN_ID})) AS campaign_variant_size,
+  (SELECT vi6.image_url FROM product_variant_image vi6
+   WHERE vi6.variant_id = (SELECT c6.variant_id FROM campaign c6 WHERE c6.id = ${BEST_CAMPAIGN_ID})
+   ORDER BY vi6.sort_order, vi6.id LIMIT 1) AS campaign_variant_image,
+  (SELECT COUNT(*) FROM campaign c7
+   WHERE c7.product_id = p.id AND c7.status = 'ACTIVE' AND (c7.end_time IS NULL OR c7.end_time > NOW())
+     AND c7.variant_id IS NOT NULL) AS active_variant_campaign_count
   FROM product p LEFT JOIN review r ON r.product_id = p.id
   WHERE p.active = true AND p.stock_quantity > 0`;
 
@@ -85,9 +128,9 @@ export const getProduct = async (productId) => {
      EXISTS (
        SELECT 1 FROM campaign c3 WHERE c3.product_id = p.id AND c3.status = 'ACTIVE'
      ) AS has_campaign,
-     (SELECT c4.hold_price FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' AND c4.hold_price > 0 LIMIT 1) AS campaign_hold_price,
-     (SELECT c4.target FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' AND c4.target > 0 LIMIT 1) AS campaign_hold_target,
-     (SELECT c4.retail_price FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' LIMIT 1) AS campaign_retail_price
+     (SELECT c4.hold_price FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' AND c4.hold_price > 0 ORDER BY c4.current_hold DESC, c4.id ASC LIMIT 1) AS campaign_hold_price,
+     (SELECT c4.target FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' AND c4.target > 0 ORDER BY c4.current_hold DESC, c4.id ASC LIMIT 1) AS campaign_hold_target,
+     (SELECT c4.retail_price FROM campaign c4 WHERE c4.product_id = p.id AND c4.status = 'ACTIVE' ORDER BY c4.current_hold DESC, c4.id ASC LIMIT 1) AS campaign_retail_price
      FROM product p
      LEFT JOIN seller s ON s.id = p.seller_id
      LEFT JOIN review r ON r.product_id = p.id
@@ -150,11 +193,16 @@ export const ensureBrowsingHistoryTable = async () => {
       id            BIGSERIAL PRIMARY KEY,
       customer_id   INT NOT NULL,
       product_id    INT NOT NULL,
-      viewed_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE (customer_id, product_id)
+      viewed_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_viewed ON browsing_history (viewed_at)`);
+  await db.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_product
+    ON browsing_history (customer_id, product_id)
+  `);
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_viewed ON browsing_history (viewed_at)
+  `);
 };
 
 // ── Track a product view ──────────────────────────────────────────────────────
@@ -164,7 +212,7 @@ export const trackProductView = async (customerId, productId) => {
     await db.query(`
       INSERT INTO browsing_history (customer_id, product_id, viewed_at)
       VALUES (?, ?, NOW())
-      ON CONFLICT (customer_id, product_id) DO UPDATE SET viewed_at = EXCLUDED.viewed_at
+      ON CONFLICT (customer_id, product_id) DO UPDATE SET viewed_at = NOW()
     `, [customerId, productId]);
     // Prune: keep last 50 views per customer
     await db.query(`
