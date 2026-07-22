@@ -2,6 +2,33 @@ import db from '../config/db.js';
 import { sendDealJoinedEmail, sendDealTargetReachedEmail } from '../config/email.js';
 import * as txSvc from './transactionService.js';
 
+// ── notifySellerNewHold ──────────────────────────────────────────────────────
+// Fires an in-app seller_notification row whenever a customer joins/adds to a
+// campaign (hold) with an initial payment. Shared by joinCampaign,
+// startOrJoinCampaign, and addToDeal so the seller portal's notification bell
+// (and the Campaign Analytics "buyers" list) both reflect new holds in
+// real time. Never throws — a notification failure must not block the
+// customer's hold/payment flow.
+const notifySellerNewHold = async ({ sellerId, customerId, productName, quantity, amount, campaignId, variantLabel = null }) => {
+  if (!sellerId) return;
+  try {
+    const [crows] = await db.query('SELECT name, email, mobile FROM customer WHERE id = ?', [customerId]);
+    const buyerName = crows[0]?.name || `Customer #${customerId}`;
+    const amtTxt = Number(amount) > 0 ? `₹${Number(amount).toLocaleString('en-IN')}` : '₹0';
+    const variantTxt = variantLabel ? ` (${variantLabel})` : '';
+    await db.query(
+      `INSERT INTO seller_notification (seller_id, title, message, created_date, read_status)
+       VALUES (?, 'New Campaign Hold 🎉', ?, NOW(), false)`,
+      [
+        sellerId,
+        `${buyerName} just joined "${productName}"${variantTxt} — ${quantity} unit(s) held, initial payment ${amtTxt} received. (Campaign #${campaignId})`,
+      ]
+    );
+  } catch (e) {
+    console.error('[campaignService] notifySellerNewHold error:', e.message);
+  }
+};
+
 // ── One-time migration ──────────────────────────────────────────────────────
 // `campaign_hold` previously had no way to record which variant (colour /
 // size) a customer picked when joining a group deal — every hold row was
@@ -132,6 +159,15 @@ export const joinCampaign = async ({ customerId, campaignId, quantity = 1, cashf
         cashfreeOrderId: cashfreeOrderId,
       });
     }
+    await notifySellerNewHold({
+      sellerId:     c.seller_id,
+      customerId,
+      productName:  c.product_name,
+      quantity,
+      amount:       totalDeposit,
+      campaignId,
+      variantLabel: c.variant_label,
+    });
   } catch (txErr) {
     console.error('[campaignService] joinCampaign deposit record error:', txErr.message);
   }
@@ -465,6 +501,15 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
           cashfreeOrderId: cashfreeOrderId,
         });
       }
+      await notifySellerNewHold({
+        sellerId:     product.seller_id,
+        customerId,
+        productName,
+        quantity,
+        amount:       totalDeposit,
+        campaignId:   campaign.id,
+        variantLabel: campaign.variant_label,
+      });
     }
   } catch (txErr) {
     console.error('[campaignService] transaction record error:', txErr.message);
@@ -558,6 +603,15 @@ export const addToDeal = async ({ customerId, productId, variantId = null, quant
           cashfreeOrderId: cashfreeOrderId,
         });
       }
+      await notifySellerNewHold({
+        sellerId:     campaign.seller_id,
+        customerId,
+        productName,
+        quantity,
+        amount:       totalDeposit,
+        campaignId:   campaign.id,
+        variantLabel: campaign.variant_label,
+      });
     }
   } catch (txErr) {
     console.error('[campaignService] addToDeal transaction error:', txErr.message);
