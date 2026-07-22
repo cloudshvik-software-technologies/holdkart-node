@@ -118,10 +118,22 @@ export const joinCampaign = async ({ customerId, campaignId, quantity = 1, cashf
   );
   if (existing.length) { const e = new Error('You have already joined this campaign'); e.status = 409; throw e; }
 
+  // Compute the deposit BEFORE inserting hold rows so each row can carry its own
+  // share of the amount paid — this is what lets the admin panel show a proper
+  // "amount paid" per buyer instead of only an aggregate campaign price.
+  const retailPrice     = Number(c.retail_price || c.product_retail_price || 0);
+  const holdPrice       = Number(c.hold_price   || c.product_hold_price   || 0);
+  const depositPerUnit  = Math.max(0, retailPrice - holdPrice);
+  const totalDeposit    = depositAmount || (depositPerUnit * quantity);
+  const depositPerRow   = quantity > 0 ? totalDeposit / quantity : 0;
+  const paymentStatus   = totalDeposit > 0 ? 'PAID' : 'NOT_REQUIRED';
+
   for (let i = 0; i < quantity; i++) {
     await db.query(
-      'INSERT INTO campaign_hold (campaign_id, customer_id, product_id) VALUES (?,?,?)',
-      [campaignId, customerId, c.product_id]
+      `INSERT INTO campaign_hold
+         (campaign_id, customer_id, product_id, deposit_amount, payment_status, cashfree_order_id)
+       VALUES (?,?,?,?,?,?)`,
+      [campaignId, customerId, c.product_id, depositPerRow, paymentStatus, cashfreeOrderId]
     );
   }
 
@@ -142,10 +154,6 @@ export const joinCampaign = async ({ customerId, campaignId, quantity = 1, cashf
   // and records the advance amount, using the actual amount paid by the
   // frontend and falling back to the calculated per-unit deposit.
   try {
-    const retailPrice    = Number(c.retail_price || c.product_retail_price || 0);
-    const holdPrice      = Number(c.hold_price   || c.product_hold_price   || 0);
-    const depositPerUnit = Math.max(0, retailPrice - holdPrice);
-    const totalDeposit   = depositAmount || (depositPerUnit * quantity);
     if (totalDeposit > 0) {
       await txSvc.record({
         customerId,
@@ -394,7 +402,7 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
   await ensureVariantColumn();
 
   const [products] = await db.query(
-    'SELECT id, seller_id, hold_target FROM product WHERE id = ? AND active = true',
+    'SELECT id, seller_id, hold_target, hold_price, retail_price, product_name, category FROM product WHERE id = ? AND active = true',
     [productId]
   );
   if (!products.length) { const e = new Error('Product not found or no longer available'); e.status = 404; throw e; }
@@ -436,9 +444,14 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
       if (vRows.length) variantLabel = [vRows[0].color, vRows[0].size].filter(Boolean).join(' / ') || null;
     }
     const [result] = await db.query(
-      `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time, variant_id, variant_label)
-       VALUES (?, ?, ?, 0, 'ACTIVE', NOW(), ?, ?)`,
-      [productId, product.seller_id, effectiveTarget, variantId || null, variantLabel]
+      `INSERT INTO campaign
+         (product_id, seller_id, target, current_hold, status, start_time,
+          variant_id, variant_label, hold_price, retail_price, product_name, category)
+       VALUES (?, ?, ?, 0, 'ACTIVE', NOW(), ?, ?, ?, ?, ?, ?)`,
+      [
+        productId, product.seller_id, effectiveTarget, variantId || null, variantLabel,
+        product.hold_price, product.retail_price, product.product_name, product.category,
+      ]
     );
     const [newCampaign] = await db.query('SELECT * FROM campaign WHERE id = ?', [result.insertId]);
     campaign = newCampaign[0];
@@ -457,11 +470,28 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
     throw e;
   }
 
+  // Look up pricing BEFORE inserting hold rows so the deposit can be recorded
+  // directly on each campaign_hold row (proper per-buyer payment tracking),
+  // not just in a loosely-linked transaction record.
+  const [priceRowsPre] = await db.query(
+    'SELECT retail_price, hold_price, product_name FROM product WHERE id = ?',
+    [productId]
+  );
+  const retailPrice    = priceRowsPre.length ? Number(priceRowsPre[0].retail_price) : 0;
+  const holdPrice      = priceRowsPre.length ? Number(priceRowsPre[0].hold_price)   : 0;
+  const productNamePre = priceRowsPre.length ? priceRowsPre[0].product_name         : null;
+  const depositPerUnit = Math.max(0, retailPrice - holdPrice);
+  const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+  const depositPerRow  = quantity > 0 ? totalDeposit / quantity : 0;
+  const paymentStatus  = totalDeposit > 0 ? 'PAID' : 'NOT_REQUIRED';
+
   // Insert one row per unit so each slot is tracked individually
   for (let i = 0; i < quantity; i++) {
     await db.query(
-      'INSERT INTO campaign_hold (campaign_id, customer_id, product_id, variant_id) VALUES (?,?,?,?)',
-      [campaign.id, customerId, productId, variantId]
+      `INSERT INTO campaign_hold
+         (campaign_id, customer_id, product_id, variant_id, deposit_amount, payment_status, cashfree_order_id)
+       VALUES (?,?,?,?,?,?,?)`,
+      [campaign.id, customerId, productId, variantId, depositPerRow, paymentStatus, cashfreeOrderId]
     );
   }
 
@@ -477,17 +507,9 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
 
   // Record deposit transaction using actual payment info from frontend
   try {
-    const [priceRows] = await db.query(
-      'SELECT retail_price, hold_price, product_name FROM product WHERE id = ?',
-      [productId]
-    );
+    const priceRows = priceRowsPre;
     if (priceRows.length) {
-      const retailPrice    = Number(priceRows[0].retail_price);
-      const holdPrice      = Number(priceRows[0].hold_price);
-      const productName    = priceRows[0].product_name;
-      const depositPerUnit = Math.max(0, retailPrice - holdPrice);
-      // Use actual amount paid from frontend; fall back to calculated deposit
-      const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+      const productName    = productNamePre;
       if (totalDeposit > 0) {
         await txSvc.record({
           customerId,
@@ -559,11 +581,27 @@ export const addToDeal = async ({ customerId, productId, variantId = null, quant
     throw e;
   }
 
+  // Look up pricing BEFORE inserting hold rows so the deposit can be recorded
+  // directly on each campaign_hold row.
+  const [priceRowsPre] = await db.query(
+    'SELECT retail_price, hold_price, product_name FROM product WHERE id = ?',
+    [productId]
+  );
+  const retailPrice    = priceRowsPre.length ? Number(priceRowsPre[0].retail_price) : 0;
+  const holdPrice      = priceRowsPre.length ? Number(priceRowsPre[0].hold_price)   : 0;
+  const productNamePre = priceRowsPre.length ? priceRowsPre[0].product_name         : null;
+  const depositPerUnit = Math.max(0, retailPrice - holdPrice);
+  const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+  const depositPerRow  = quantity > 0 ? totalDeposit / quantity : 0;
+  const paymentStatus  = totalDeposit > 0 ? 'PAID' : 'NOT_REQUIRED';
+
   // Insert one row per unit
   for (let i = 0; i < quantity; i++) {
     await db.query(
-      'INSERT INTO campaign_hold (campaign_id, customer_id, product_id, variant_id) VALUES (?,?,?,?)',
-      [campaign.id, customerId, productId, variantId]
+      `INSERT INTO campaign_hold
+         (campaign_id, customer_id, product_id, variant_id, deposit_amount, payment_status, cashfree_order_id)
+       VALUES (?,?,?,?,?,?,?)`,
+      [campaign.id, customerId, productId, variantId, depositPerRow, paymentStatus, cashfreeOrderId]
     );
   }
 
@@ -580,16 +618,9 @@ export const addToDeal = async ({ customerId, productId, variantId = null, quant
 
   // Record deposit transaction for the added slots
   try {
-    const [priceRows] = await db.query(
-      'SELECT retail_price, hold_price, product_name FROM product WHERE id = ?',
-      [productId]
-    );
+    const priceRows = priceRowsPre;
     if (priceRows.length) {
-      const retailPrice    = Number(priceRows[0].retail_price);
-      const holdPrice      = Number(priceRows[0].hold_price);
-      const productName    = priceRows[0].product_name;
-      const depositPerUnit = Math.max(0, retailPrice - holdPrice);
-      const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+      const productName    = productNamePre;
       if (totalDeposit > 0) {
         await txSvc.record({
           customerId,
