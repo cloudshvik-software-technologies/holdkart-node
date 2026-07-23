@@ -35,15 +35,31 @@ export const appendLedgerEntry = async ({
     throw new Error(`appendLedgerEntry: invalid amount ${amount}`);
   }
 
-  const [result] = await conn.query(
-    `INSERT INTO ledger_entry
-       (entry_type, direction, order_id, order_number, customer_id, seller_id, campaign_id,
-        amount, method, status, reference_table, reference_id, description, created_by)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [entryType, direction, orderId, orderNumber, customerId, sellerId, campaignId,
-     amt, method, status, referenceTable, referenceId, description, CREATED_BY]
-  );
-  return result.insertId;
+  // FIX: this insert previously could fail silently — callers in
+  // campaignService (joinCampaign / startOrJoinCampaign / addToDeal) wrap
+  // it in `.catch(e => console.error(...))`, which stops the failure from
+  // breaking the customer's payment flow, but a truncated/generic message
+  // was near-impossible to diagnose from logs. Log the full error object
+  // (code, detail, table/column) here, at the source, before it's caught
+  // upstream, so a failed write is actually traceable.
+  try {
+    const [result] = await conn.query(
+      `INSERT INTO ledger_entry
+         (entry_type, direction, order_id, order_number, customer_id, seller_id, campaign_id,
+          amount, method, status, reference_table, reference_id, description, created_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [entryType, direction, orderId, orderNumber, customerId, sellerId, campaignId,
+       amt, method, status, referenceTable, referenceId, description, CREATED_BY]
+    );
+    return result.insertId;
+  } catch (err) {
+    console.error('[ledgerService.appendLedgerEntry] INSERT FAILED', {
+      entryType, direction, amount: amt, customerId, sellerId, campaignId,
+      method, referenceTable, referenceId,
+      pgCode: err.code, pgDetail: err.detail, message: err.message,
+    });
+    throw err;
+  }
 };
 
 // ─── Shared commission calculation (§3.2) ───────────────────────────────────

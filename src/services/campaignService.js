@@ -1,6 +1,7 @@
 import db from '../config/db.js';
 import { sendDealJoinedEmail, sendDealTargetReachedEmail } from '../config/email.js';
 import * as txSvc from './transactionService.js';
+import * as ledger from './ledgerService.js';
 
 // ── notifySellerNewHold ──────────────────────────────────────────────────────
 // Fires an in-app seller_notification row whenever a customer joins/adds to a
@@ -166,6 +167,21 @@ export const joinCampaign = async ({ customerId, campaignId, quantity = 1, cashf
         description:     `Deal deposit for "${c.product_name}" x${quantity} (Campaign #${campaignId})`,
         cashfreeOrderId: cashfreeOrderId,
       });
+
+      // FIX: a campaign join collects real, non-refundable money the instant
+      // it's paid (see order_cancel_request / exitCampaign — deposits are
+      // forfeited to the seller if the customer exits, never refunded to the
+      // customer). Previously this only wrote to customer_transaction, which
+      // nothing in admin GMV/profit reads — the deposit was invisible on
+      // every admin dashboard until (and unless) the hold later converted
+      // into an actual order. Appending to the ledger here makes it visible
+      // immediately, as its own line, the moment it's collected.
+      await ledger.appendLedgerEntry({
+        entryType: 'PAYMENT', direction: 'CREDIT', amount: totalDeposit,
+        customerId, sellerId: c.seller_id, campaignId,
+        method: 'DEAL_DEPOSIT', referenceTable: 'campaign_hold', referenceId: campaignId,
+        description: `Deal deposit for "${c.product_name}" x${quantity} (Campaign #${campaignId})`,
+      }).catch(e => console.error('[joinCampaign] ledger append failed (non-fatal):', e.message));
     }
     await notifySellerNewHold({
       sellerId:     c.seller_id,
@@ -522,6 +538,17 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
           description:     `Deal deposit for "${productName}" x${quantity} (Campaign #${campaign.id})`,
           cashfreeOrderId: cashfreeOrderId,
         });
+
+        // FIX: deposits must hit the ledger the moment they're collected,
+        // not only once/if the hold converts into an order — otherwise it's
+        // invisible on admin GMV/profit until conversion (or forever, if the
+        // customer exits and it's forfeited instead — see exitCampaign).
+        await ledger.appendLedgerEntry({
+          entryType: 'PAYMENT', direction: 'CREDIT', amount: totalDeposit,
+          customerId, sellerId: product.seller_id, campaignId: campaign.id,
+          method: 'DEAL_DEPOSIT', referenceTable: 'campaign_hold', referenceId: campaign.id,
+          description: `Deal deposit for "${productName}" x${quantity} (Campaign #${campaign.id})`,
+        }).catch(e => console.error('[startOrJoinCampaign] ledger append failed (non-fatal):', e.message));
       }
       await notifySellerNewHold({
         sellerId:     product.seller_id,
@@ -633,6 +660,15 @@ export const addToDeal = async ({ customerId, productId, variantId = null, quant
           description:     `Deal deposit for "${productName}" x${quantity} (Campaign #${campaign.id})`,
           cashfreeOrderId: cashfreeOrderId,
         });
+
+        // FIX: same as joinCampaign/startOrJoinCampaign — write to the
+        // ledger the moment the deposit is collected.
+        await ledger.appendLedgerEntry({
+          entryType: 'PAYMENT', direction: 'CREDIT', amount: totalDeposit,
+          customerId, sellerId: campaign.seller_id, campaignId: campaign.id,
+          method: 'DEAL_DEPOSIT', referenceTable: 'campaign_hold', referenceId: campaign.id,
+          description: `Deal deposit for "${productName}" x${quantity} (Campaign #${campaign.id}) — added slots`,
+        }).catch(e => console.error('[addToDeal] ledger append failed (non-fatal):', e.message));
       }
       await notifySellerNewHold({
         sellerId:     campaign.seller_id,

@@ -309,21 +309,40 @@ export const placeOrder = async ({
         ADD COLUMN customer_courier_name VARCHAR(255) DEFAULT NULL`);
     } catch {}
 
-    // Ensure advance/balance columns exist (safe to call multiple times) —
-    // see migrations/001_unified_ledger.sql for the canonical version.
+    // Ensure advance/balance/total columns exist (safe to call multiple times) —
+    // see migrations/001_unified_ledger.sql / 002_total_amount.sql for the
+    // canonical versions.
     try {
       await db.query(`ALTER TABLE orders
         ADD COLUMN advance_amount NUMERIC(10,2) DEFAULT 0,
-        ADD COLUMN balance_amount NUMERIC(10,2) DEFAULT 0`);
+        ADD COLUMN balance_amount NUMERIC(10,2) DEFAULT 0,
+        ADD COLUMN total_amount NUMERIC(10,2) DEFAULT 0`);
     } catch {}
+
+    // FIX: total_amount is what the customer actually paid — product +
+    // delivery + platform fee + payment handling fee + protect promise fee.
+    // order_amount stays PRODUCT PRICE ONLY (it's the base seller commission
+    // is calculated on — see holdkart-seller-node's calcCommission). Every
+    // admin GMV/order-total/customer-LTV read should use total_amount, not
+    // order_amount, or it silently drops delivery + platform fee from every
+    // number it shows (this was the root cause of admin dashboards showing
+    // ₹65 instead of ₹155.85 for a ₹65 product + ₹80.85 delivery + ₹10
+    // platform fee order).
+    const totalAmount = Math.round((
+      advanceAmount + balanceAmount
+      + (Number(itemDeliveryCharge) || 0)
+      + (Number(platformFee) || 0)
+      + (Number(paymentHandlingFee) || 0)
+      + (Number(protectPromiseFee) || 0)
+    ) * 100) / 100;
 
     const [r] = await db.query(
       `INSERT INTO orders (order_number, sub_order_number, product_id, variant_id, seller_id, customer_id, quantity, order_amount,
         order_status, order_date, payment_status, delivery_status, address, category,
         product_name, customer_name, created_date, payment_method, customer_email, customer_phone,
         city, pincode, state, delivery_charge, platform_fee, payment_handling_fee, protect_promise_fee,
-        customer_courier_id, customer_courier_name, advance_amount, balance_amount)
-       VALUES (?,?,?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        customer_courier_id, customer_courier_name, advance_amount, balance_amount, total_amount)
+       VALUES (?,?,?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [orderNumber, subOrderNumber, p.id, vId, p.seller_id, customerId, item.quantity, amount,
        resolvedPaymentStatus,
        'Pending', address, p.category, p.product_name,
@@ -335,7 +354,7 @@ export const placeOrder = async ({
        // BuyNow.jsx now send these on each item) so the seller can see it.
        item.courierId   != null ? Number(item.courierId) : null,
        item.courierName || null,
-       advanceAmount, balanceAmount]
+       advanceAmount, balanceAmount, totalAmount]
     );
 
     // FIX (§1 / §3.1): append to the unified ledger instead of leaving this
@@ -344,12 +363,24 @@ export const placeOrder = async ({
     // shared across all three backends.
     try {
       if (advanceAmount > 0) {
-        await ledger.appendLedgerEntry({
-          entryType: 'PAYMENT', direction: 'CREDIT', amount: advanceAmount,
-          orderId: r.insertId, orderNumber: subOrderNumber, customerId, sellerId: p.seller_id,
-          method: 'DEAL_DEPOSIT', referenceTable: 'orders', referenceId: r.insertId,
-          description: `Deal deposit for ${p.product_name}`,
-        });
+        // FIX: the deposit was already appended to the ledger at
+        // campaign-join time (see campaignService.js joinCampaign /
+        // startOrJoinCampaign / addToDeal) — that's the moment the money was
+        // actually collected. Writing a second PAYMENT entry for the same
+        // amount here would double-count it in GMV. Instead, just link the
+        // existing deposit ledger row(s) to this order now that it has one,
+        // so admin can trace deposit -> converted order.
+        await db.query(
+          `UPDATE ledger_entry SET order_id = ?, order_number = ?
+           WHERE id = (
+             SELECT id FROM ledger_entry
+             WHERE customer_id = ? AND entry_type = 'PAYMENT' AND method = 'DEAL_DEPOSIT'
+               AND order_id IS NULL AND status = 'SUCCESS' AND amount = ?
+               AND description LIKE ?
+             ORDER BY id DESC LIMIT 1
+           )`,
+          [r.insertId, subOrderNumber, customerId, advanceAmount, `%${p.product_name}%`]
+        ).catch(() => {});
       }
       if (balanceAmount > 0 || paymentMethod !== 'COD') {
         await ledger.appendLedgerEntry({
