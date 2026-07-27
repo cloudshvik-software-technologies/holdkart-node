@@ -73,22 +73,31 @@ const DEFAULT_COMMISSION_PCT = 2;
 export const calcCommission = async ({ grossAmount, categoryId = null, isDealOrder = false }, conn = db) => {
   const gross = Number(grossAmount) || 0;
   let pct = DEFAULT_COMMISSION_PCT;
+  let gatewayPct = 0;
 
-  if (isDealOrder) {
-    pct = DEAL_COMMISSION_PCT;
-  } else if (categoryId != null) {
+  if (categoryId != null) {
     const [rows] = await conn.query(
-      'SELECT commission_pct FROM category WHERE id = ?',
+      'SELECT commission_pct, deal_commission_pct, gateway_fee_pct FROM category WHERE id = ?',
       [categoryId]
     );
-    if (rows.length && rows[0].commission_pct != null) {
-      pct = Number(rows[0].commission_pct);
+    if (rows.length) {
+      if (isDealOrder) {
+        pct = rows[0].deal_commission_pct != null ? Number(rows[0].deal_commission_pct) : DEAL_COMMISSION_PCT;
+      } else if (rows[0].commission_pct != null) {
+        pct = Number(rows[0].commission_pct);
+      }
+      gatewayPct = Number(rows[0].gateway_fee_pct) || 0;
+    } else if (isDealOrder) {
+      pct = DEAL_COMMISSION_PCT;
     }
+  } else if (isDealOrder) {
+    pct = DEAL_COMMISSION_PCT;
   }
 
   const commission = Math.round(gross * (pct / 100) * 100) / 100;
-  const netAmount = Math.round((gross - commission) * 100) / 100;
-  return { pct, commission, netAmount };
+  const gatewayFee  = Math.round(gross * (gatewayPct / 100) * 100) / 100;
+  const netAmount   = Math.round((gross - commission) * 100) / 100;
+  return { pct, commission, netAmount, gatewayPct, gatewayFee };
 };
 
 // ─── Reads — every dashboard should use these instead of re-deriving totals ─

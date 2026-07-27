@@ -187,6 +187,13 @@ export const placeOrder = async ({
   if (!items || !items.length) throw new Error('No items in order');
   await ensureOrderVariantColumn();
 
+  // Platform fee is admin-configurable now (Commission Settings screen),
+  // never trusted from the client.
+  const [feeSettingRows] = await db.query(
+    `SELECT value FROM platform_settings WHERE key = 'platform_fee'`
+  );
+  platformFee = feeSettingRows.length ? Number(feeSettingRows[0].value) : 5;
+
   // SECURITY FIX (critical payment bypass): this previously marked any order
   // with paymentMethod === 'Online' as payment_status = 'Paid' immediately at
   // creation, purely on the client's say-so — no payment had to actually
@@ -250,6 +257,10 @@ export const placeOrder = async ({
     const customer = crows[0];
     subSeq += 1;
     const subOrderNumber = `${orderNumber}-${subSeq}`;
+    // FIX: platform fee is charged once per checkout (Cashfree only collects
+    // it once), not once per item — only the first row in a multi-item cart
+    // carries it, so SUM(platform_fee) across orders can't overcount.
+    const itemPlatformFee = subSeq === 1 ? platformFee : 0;
     const [cartRow] = await db.query(
       "SELECT price_type, locked_price, deposit_paid FROM cart WHERE customer_id = ? AND product_id = ? AND variant_id = ? AND price_type = 'DEAL' LIMIT 1",
       [customerId, item.productId, vId]
@@ -331,7 +342,7 @@ export const placeOrder = async ({
     const totalAmount = Math.round((
       advanceAmount + balanceAmount
       + (Number(itemDeliveryCharge) || 0)
-      + (Number(platformFee) || 0)
+      + (Number(itemPlatformFee) || 0)
       + (Number(paymentHandlingFee) || 0)
       + (Number(protectPromiseFee) || 0)
     ) * 100) / 100;
@@ -348,7 +359,7 @@ export const placeOrder = async ({
        'Pending', address, p.category, p.product_name,
        customer?.name || '', paymentMethod,
        customer?.email || '', customer?.mobile || '', city, pincode, state,
-       Number(itemDeliveryCharge) || 0, Number(platformFee) || 0,
+       Number(itemDeliveryCharge) || 0, Number(itemPlatformFee) || 0,
        Number(paymentHandlingFee) || 0, Number(protectPromiseFee) || 0,
        // BUG FIX: store what the customer selected at checkout (Checkout.jsx /
        // BuyNow.jsx now send these on each item) so the seller can see it.

@@ -23,6 +23,7 @@ import advertisementRoutes   from './routes/advertisement.js';
 import shippingRoutes        from './routes/shipping.js';
 import { notFound, errorHandler } from './middleware/errorHandler.js';
 import env from './config/env.js';
+import configRoutes from './routes/config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
@@ -106,6 +107,7 @@ app.use('/api/customer/campaign',      campaignRoutes);
 app.use('/api/customer/payment',       paymentRoutes);
 app.use('/api/customer/ads',           advertisementRoutes);
 app.use('/api/customer/shipping',      shippingRoutes);
+app.use('/api/customer/config',        configRoutes);
 
 app.get('/health', (_req, res) => res.json({ status: 'OK', service: 'holdkart-customer-backend' }));
 
