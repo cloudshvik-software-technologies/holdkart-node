@@ -157,6 +157,15 @@ export const getCart = async (customerId) => {
     // when not explicitly set to false, matching the seller-side AddProduct default).
     const shipCod    = specs.ship_cod    !== false;
     const shipOnline = specs.ship_online !== false;
+    // Per-unit packed weight (kg) set by the seller in Add/Edit Product's
+    // "Packed dimensions & weight" section. May be absent if the seller
+    // never filled it in — frontend should treat null/0 as "unknown" rather
+    // than silently defaulting, since a silent 0.5 default is exactly the
+    // bug that caused every Shiprocket serviceability call to look identical
+    // regardless of the real product weight.
+    const unitWeight = specs.ship_weight != null && specs.ship_weight !== ''
+      ? Number(specs.ship_weight)
+      : null;
     // Resolve best available retail and deal prices:
     // locked_price in cart may be 0 if campaign prices weren't on product table at completion time.
     // Fall back to campaign.hold_price (most recent campaign with a price) or product.hold_price.
@@ -202,6 +211,10 @@ export const getCart = async (customerId) => {
       subtotal:      effectivePrice * r.quantity,
       shipCod,
       shipOnline,
+      // Per-unit weight in kg (null if the seller hasn't set one yet).
+      // Multiply by quantity on the frontend to get total_weight, same as
+      // the existing `item.quantity * item.weight` calculation.
+      weight:        unitWeight,
     };
   });
 };
