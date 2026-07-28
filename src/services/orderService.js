@@ -294,6 +294,21 @@ export const placeOrder = async ({
       ? Number(item.deliveryCharge) || 0
       : Number(deliveryCharge) || 0;
 
+    // FIX: itemDeliveryCharge already includes the platform's delivery
+    // commission markup (applied in getAvailableCouriers). Never trust a
+    // client-supplied "actual cost" — recompute it server-side by reversing
+    // today's markup rate, the same principle used for platform_fee.
+    let deliveryCommissionPct = 5;
+    try {
+      const [settingRows] = await db.query(
+        `SELECT value FROM platform_settings WHERE key = 'delivery_commission_pct'`
+      );
+      if (settingRows.length) deliveryCommissionPct = Number(settingRows[0].value) || 0;
+    } catch {}
+    const shiprocketActualCost = Math.round(
+      (itemDeliveryCharge / (1 + deliveryCommissionPct / 100)) * 100
+    ) / 100;
+
     // Add fee columns if missing (safe to call multiple times)
     try {
       await db.query(`ALTER TABLE orders
@@ -330,6 +345,10 @@ export const placeOrder = async ({
         ADD COLUMN total_amount NUMERIC(10,2) DEFAULT 0`);
     } catch {}
 
+    try {
+      await db.query(`ALTER TABLE orders ADD COLUMN shiprocket_actual_cost NUMERIC(10,2) DEFAULT 0`);
+    } catch {}
+
     // FIX: total_amount is what the customer actually paid — product +
     // delivery + platform fee + payment handling fee + protect promise fee.
     // order_amount stays PRODUCT PRICE ONLY (it's the base seller commission
@@ -352,8 +371,8 @@ export const placeOrder = async ({
         order_status, order_date, payment_status, delivery_status, address, category,
         product_name, customer_name, created_date, payment_method, customer_email, customer_phone,
         city, pincode, state, delivery_charge, platform_fee, payment_handling_fee, protect_promise_fee,
-        customer_courier_id, customer_courier_name, advance_amount, balance_amount, total_amount)
-       VALUES (?,?,?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        customer_courier_id, customer_courier_name, advance_amount, balance_amount, total_amount, shiprocket_actual_cost)
+       VALUES (?,?,?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [orderNumber, subOrderNumber, p.id, vId, p.seller_id, customerId, item.quantity, amount,
        resolvedPaymentStatus,
        'Pending', address, p.category, p.product_name,
@@ -365,7 +384,7 @@ export const placeOrder = async ({
        // BuyNow.jsx now send these on each item) so the seller can see it.
        item.courierId   != null ? Number(item.courierId) : null,
        item.courierName || null,
-       advanceAmount, balanceAmount, totalAmount]
+       advanceAmount, balanceAmount, totalAmount, shiprocketActualCost]
     );
 
     // FIX (§1 / §3.1): append to the unified ledger instead of leaving this
