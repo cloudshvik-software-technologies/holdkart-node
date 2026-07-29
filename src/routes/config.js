@@ -15,4 +15,13 @@ r.get('/platform-fee', async (req, res) => {
   }
 });
 
+r.get('/return-video-threshold', async (req, res) => {
+  try {
+    const [rows] = await db.query(`SELECT value FROM platform_settings WHERE key = 'return_video_threshold'`);
+    res.json({ threshold: rows.length ? Number(rows[0].value) : 5000 });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 export default r;

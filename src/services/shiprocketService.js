@@ -149,6 +149,11 @@ export async function trackByAwb(awbCode) {
   const data = await res.json();
   if (!res.ok) throw new Error('Tracking failed: ' + JSON.stringify(data));
 
+  // DIAGNOSTIC — Part 4: checking whether Shiprocket's response includes
+  // any proof-of-delivery/pickup photo field on your actual account/plan.
+  // Remove this once confirmed either way.
+  console.log('[Part 4 diagnostic] Full Shiprocket tracking response:', JSON.stringify(data, null, 2));
+
   const info = data.tracking_data?.shipment_track?.[0] || {};
   return {
     currentStatus:  info.current_status      || 'Unknown',
