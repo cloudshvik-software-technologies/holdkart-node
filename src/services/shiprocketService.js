@@ -38,6 +38,7 @@ export async function createShiprocketOrder({
   address, city, pincode, state,
   productName, quantity, price,
   weight = 0.5,
+  length = 10, breadth = 10, height = 10,
 }) {
   // Log what we received so empty fields are visible in the terminal
   console.log('[Shiprocket] createShiprocketOrder fields:', {
@@ -84,9 +85,9 @@ export async function createShiprocketOrder({
     ],
     payment_method: 'Prepaid',
     sub_total:      price * quantity,
-    length:         10,
-    breadth:        10,
-    height:         10,
+    length,
+    breadth,
+    height,
     weight,
   };
 
@@ -148,11 +149,6 @@ export async function trackByAwb(awbCode) {
   });
   const data = await res.json();
   if (!res.ok) throw new Error('Tracking failed: ' + JSON.stringify(data));
-
-  // DIAGNOSTIC — Part 4: checking whether Shiprocket's response includes
-  // any proof-of-delivery/pickup photo field on your actual account/plan.
-  // Remove this once confirmed either way.
-  console.log('[Part 4 diagnostic] Full Shiprocket tracking response:', JSON.stringify(data, null, 2));
 
   const info = data.tracking_data?.shipment_track?.[0] || {};
   return {

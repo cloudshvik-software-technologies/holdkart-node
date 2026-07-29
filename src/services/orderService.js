@@ -261,11 +261,39 @@ export const placeOrder = async ({
     // it once), not once per item — only the first row in a multi-item cart
     // carries it, so SUM(platform_fee) across orders can't overcount.
     const itemPlatformFee = subSeq === 1 ? platformFee : 0;
-    const [cartRow] = await db.query(
-      "SELECT price_type, locked_price, deposit_paid FROM cart WHERE customer_id = ? AND product_id = ? AND variant_id = ? AND price_type = 'DEAL' LIMIT 1",
-      [customerId, item.productId, vId]
-    );
-    const isDealItem  = cartRow.length > 0;
+
+    // BUG FIX: this used to look up the cart row by
+    // `customer_id + product_id + variant_id + price_type = 'DEAL'`, with no
+    // way to tell which cart row THIS checkout item actually came from. If a
+    // customer bought the same product both as a normal item AND as a
+    // campaign deal in one checkout (two separate cart rows, same
+    // product/variant), that query matched the DEAL row on *every* iteration
+    // — so the normal item was also priced at the deal's hold price and had
+    // the deal's whole deposit wrongly subtracted from it, while the deal
+    // item still worked correctly. Net effect: total revenue for the
+    // checkout came out short (e.g. ₹120 instead of the correct ₹165 for a
+    // ₹65 normal order + a 2-qty ₹50 deal with ₹30 deposit already paid).
+    //
+    // FIX: the frontend now sends item.cartId — the exact cart row this line
+    // was built from (see Checkout.jsx placeCOD/placeOnline). Look that row
+    // up directly by id instead of guessing by product+variant, so a normal
+    // item and a deal item for the same product can never be confused.
+    let cartRow = [];
+    if (item.cartId != null) {
+      [cartRow] = await db.query(
+        "SELECT price_type, locked_price, deposit_paid FROM cart WHERE id = ? AND customer_id = ?",
+        [item.cartId, customerId]
+      );
+    } else {
+      // Fallback for any caller that hasn't been updated to send cartId yet.
+      // Kept narrow (still requires price_type = 'DEAL') to preserve old
+      // behaviour for single-item / non-mixed checkouts.
+      [cartRow] = await db.query(
+        "SELECT price_type, locked_price, deposit_paid FROM cart WHERE customer_id = ? AND product_id = ? AND variant_id = ? AND price_type = 'DEAL' LIMIT 1",
+        [customerId, item.productId, vId]
+      );
+    }
+    const isDealItem  = cartRow.length > 0 && cartRow[0].price_type === 'DEAL';
     // BUG FIX: for a regular (non-deal) purchase of a specific variant, the
     // variant's own price_override must win over the base product's
     // retail_price. Previously this always used p.retail_price regardless of
@@ -503,6 +531,22 @@ export const placeOrder = async ({
         ? customer.mobile
         : '9999999999';
 
+      // Compute real parcel weight/dims from the product's specs (set by the
+      // seller / admin) rather than relying on shiprocketService's 0.5kg /
+      // 10cm defaults. Multiply weight by quantity since this is the total
+      // weight for this line's shipment.
+      let productSpecs = p.specs;
+      if (typeof productSpecs === 'string') {
+        try { productSpecs = JSON.parse(productSpecs); } catch (_) { productSpecs = null; }
+      }
+      const unitWeight = parseFloat(productSpecs?.ship_weight);
+      const shipmentWeight = (!Number.isNaN(unitWeight) && unitWeight > 0)
+        ? Math.round(unitWeight * item.quantity * 1000) / 1000
+        : 0.5; // legacy fallback only — new products require ship_weight at creation
+      const shipLength = parseFloat(productSpecs?.ship_length) || 10;
+      const shipWidth   = parseFloat(productSpecs?.ship_width)  || 10;
+      const shipHeight  = parseFloat(productSpecs?.ship_height) || 10;
+
       const sr = await shiprocket.createShiprocketOrder({
         orderId:       r.insertId,
         orderNumber,
@@ -517,6 +561,10 @@ export const placeOrder = async ({
         productName:   p.product_name,
         quantity:      item.quantity,
         price:         lockedPrice,
+        weight:        shipmentWeight,
+        length:        shipLength,
+        breadth:       shipWidth,
+        height:        shipHeight,
       });
 
       // Try to auto-assign AWB + get label if shipment_id is available
@@ -766,17 +814,8 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
   if (!rows.length) { const e = new Error('Order not found'); e.status = 404; throw e; }
   const order = rows[0];
 
-  // FIX (Part D): a shipped order was previously "cancellable" through a
-  // seller-approval flow — but a courier already carrying the package
-  // can't be recalled mid-route. Standard practice (Amazon/Flipkart) is to
-  // let the customer refuse delivery at the door instead, which the
-  // courier reports back as an RTO — already handled correctly by the
-  // existing RTO webhook path, no new mechanism needed. Cancellation is
-  // now only offered before shipment.
-  if (!['Pending', 'Confirmed'].includes(order.order_status)) {
-    const e = new Error('This order has already shipped and can no longer be cancelled — you can refuse it at delivery, or return it once delivered.');
-    e.status = 400;
-    throw e;
+  if (!['Pending', 'Confirmed', 'Shipped'].includes(order.order_status)) {
+    const e = new Error('Cannot request cancellation for this order'); e.status = 400; throw e;
   }
 
   // Replacement is only available post-delivery; before/during shipment → Refund/Cancellation only
@@ -1113,17 +1152,7 @@ export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, 
  * Only allowed when order_status is 'Delivered'.
  * Uses the same order_cancel_request table as cancellations.
  */
-// Seller-fault reasons — matches SELLER_FAULT_REASONS in seller_node's
-// walletService.js and RETURN_REASONS in customer_react's Orders.jsx.
-const SELLER_FAULT_REASONS = [
-  'Item is defective or damaged',
-  'Item does not match description',
-  'Wrong item was delivered',
-  'Item is of poor quality',
-  'Missing parts or accessories',
-];
-
-export const returnOrder = async ({ orderId, customerId, cancellation_reason, resolution_type, evidenceItems = [] }) => {
+export const returnOrder = async ({ orderId, customerId, cancellation_reason, resolution_type }) => {
   const [rows] = await db.query('SELECT * FROM orders WHERE id = ? AND customer_id = ?', [orderId, customerId]);
   if (!rows.length) { const e = new Error('Order not found'); e.status = 404; throw e; }
   const order = rows[0];
@@ -1155,30 +1184,6 @@ export const returnOrder = async ({ orderId, customerId, cancellation_reason, re
     }
   }
 
-  // Require evidence for seller-fault reasons — matches the chargeback logic
-  // that later reads this same reason to decide whether to charge the
-  // seller for Shiprocket cost + gateway fee. No evidence, no basis for
-  // that charge, so it's enforced right here at request time.
-  if (SELLER_FAULT_REASONS.includes(cancellation_reason) && evidenceItems.length === 0) {
-    const e = new Error('At least one photo is required for this return reason'); e.status = 400; throw e;
-  }
-
-  // Part 3: above a configurable order value, a video replaces "optional
-  // photos" with a hard requirement — regardless of stated reason, since
-  // high-value items warrant stronger evidence than a still photo can give,
-  // including against a false "arrived empty/damaged" claim.
-  const [thresholdRows] = await db.query(
-    `SELECT value FROM platform_settings WHERE key = 'return_video_threshold'`
-  );
-  const videoThreshold = thresholdRows.length ? Number(thresholdRows[0].value) : 5000;
-  const orderValue = (parseFloat(order.order_amount) || 0) + (parseFloat(order.advance_amount) || 0);
-  const hasVideo = evidenceItems.some(e => e.type === 'video');
-  if (orderValue >= videoThreshold && !hasVideo) {
-    const e = new Error(`Orders above ₹${videoThreshold.toLocaleString('en-IN')} require an unboxing video, not just photos`);
-    e.status = 400;
-    throw e;
-  }
-
   await db.query(
     "UPDATE orders SET order_status = 'Return Requested', cancellation_reason = ?, resolution_type = ? WHERE id = ?",
     [cancellation_reason || null, resType, orderId]
@@ -1186,9 +1191,9 @@ export const returnOrder = async ({ orderId, customerId, cancellation_reason, re
 
   await db.query(
     `INSERT INTO order_cancel_request
-       (order_id, customer_id, seller_id, cancellation_reason, resolution_type, status, created_at, evidence_photo_urls)
-     VALUES (?, ?, ?, ?, ?, 'Pending', NOW(), ?)`,
-    [orderId, customerId, order.seller_id, cancellation_reason || null, resType, JSON.stringify(evidenceItems)]
+       (order_id, customer_id, seller_id, cancellation_reason, resolution_type, status, created_at)
+     VALUES (?, ?, ?, ?, ?, 'Pending', NOW())`,
+    [orderId, customerId, order.seller_id, cancellation_reason || null, resType]
   );
 
   await db.query(
