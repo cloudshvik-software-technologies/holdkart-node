@@ -36,9 +36,15 @@ const syncProductStockFromVariants = async (productId) => {
 const notifySeller = async (sellerId, title, message) => {
   if (!sellerId) return;
   try {
+    // FIX: read_status is `boolean NOT NULL` in Postgres, not MySQL's
+    // TINYINT — inserting the literal `0` here threw "column read_status
+    // is of type boolean but expression is of type integer" on every call.
+    // That error was silently swallowed by the catch below, so the order
+    // itself always succeeded while the seller notification row was never
+    // actually written. Use `false` instead of `0` so the insert succeeds.
     await db.query(
       `INSERT INTO seller_notification (seller_id, title, message, created_date, read_status)
-       VALUES (?, ?, ?, NOW(), 0)`,
+       VALUES (?, ?, ?, NOW(), false)`,
       [sellerId, title, message]
     );
   } catch (e) {
@@ -244,13 +250,37 @@ export const placeOrder = async ({
     // product stock instead, letting a sold-out variant keep showing as
     // in-stock.
     let variantRow = null;
+
+    // BUG FIX: a customer joining a campaign pays a real, non-refundable
+    // deposit (see joinCampaign) but that never reserved any physical
+    // stock — product.stock_quantity is only ever touched by an actual
+    // order. So a second customer buying the SAME product through a normal
+    // (non-campaign) order could freely drain stock a deal customer had
+    // already put money down on. Once stock hit 0 the product vanished
+    // from every listing (seller + customer), silently stranding the
+    // campaign with deposits collected but nothing left to fulfill them —
+    // while the admin ledger, correctly, still showed that advance amount.
+    // Fix: normal-order stock checks must subtract units already committed
+    // to this product/variant's active campaign(s), so a plain order can
+    // never eat into inventory a deal depositor is already holding.
+    const [activeCampaignsForStock] = await db.query(
+      "SELECT current_hold, variant_id FROM campaign WHERE product_id = ? AND status = 'ACTIVE'",
+      [p.id]
+    );
+    const matchedForStock = activeCampaignsForStock.filter(c =>
+      vId ? Number(c.variant_id) === vId : !c.variant_id
+    );
+    const campaignCommitted = matchedForStock.reduce((sum, c) => sum + (Number(c.current_hold) || 0), 0);
+
     if (vId) {
       const [vrows] = await db.query('SELECT * FROM product_variant WHERE id = ? AND product_id = ?', [vId, p.id]);
       if (!vrows.length) throw Object.assign(new Error(`Variant not found for ${p.product_name}`), { status: 404 });
       variantRow = vrows[0];
-      if (variantRow.stock_quantity < item.quantity) throw Object.assign(new Error(`Insufficient stock for ${p.product_name}`), { status: 400 });
+      const availableVariantStock = variantRow.stock_quantity - campaignCommitted;
+      if (availableVariantStock < item.quantity) throw Object.assign(new Error(`Insufficient stock for ${p.product_name}`), { status: 400 });
     } else {
-      if (p.stock_quantity < item.quantity) throw Object.assign(new Error(`Insufficient stock for ${p.product_name}`), { status: 400 });
+      const availableStock = p.stock_quantity - campaignCommitted;
+      if (availableStock < item.quantity) throw Object.assign(new Error(`Insufficient stock for ${p.product_name}`), { status: 400 });
     }
 
     const [crows] = await db.query('SELECT * FROM customer WHERE id = ?', [customerId]);
@@ -460,24 +490,38 @@ export const placeOrder = async ({
       await db.query('UPDATE product SET stock_quantity = stock_quantity - ? WHERE id = ?', [item.quantity, p.id]);
     }
 
-    // Match the campaign for the exact variant being checked out — a product can
-    // have several variant-scoped campaigns active at once, so grabbing "any"
-    // active campaign here could clear/decrement the wrong one.
-    const [activeCampaigns] = await db.query(
-      "SELECT id, variant_id FROM campaign WHERE product_id = ? AND status = 'ACTIVE'",
-      [p.id]
-    );
-    const matchedCampaign = activeCampaigns.find(c => vId && Number(c.variant_id) === vId)
-      || activeCampaigns.find(c => !c.variant_id);
-    if (matchedCampaign) {
-      const campaignId = matchedCampaign.id;
-      const [holdRow] = await db.query(
-        'SELECT id FROM campaign_hold WHERE campaign_id = ? AND customer_id = ? AND variant_id = ?',
-        [campaignId, customerId, vId]
+    // BUG FIX: this ran unconditionally for every order item, regardless of
+    // whether the item was actually a deal conversion — so a customer who
+    // had joined a group deal (paid the advance, campaign_hold row exists)
+    // and then separately placed a completely unrelated NORMAL order for
+    // the same product would have their hold silently deleted and
+    // current_hold decremented right here, even though this order had
+    // nothing to do with the deal. That's what made the "1/2 joined" +
+    // "Joined this deal" state vanish back to "0/2 joined" the moment a
+    // normal order was placed. Only clear the hold when this item is the
+    // actual deal purchase (isDealItem, set above from the cart row's
+    // price_type — see the cartRow lookup) — a normal order must never
+    // touch another campaign's hold state.
+    if (isDealItem) {
+      // Match the campaign for the exact variant being checked out — a product can
+      // have several variant-scoped campaigns active at once, so grabbing "any"
+      // active campaign here could clear/decrement the wrong one.
+      const [activeCampaigns] = await db.query(
+        "SELECT id, variant_id FROM campaign WHERE product_id = ? AND status = 'ACTIVE'",
+        [p.id]
       );
-      if (holdRow.length) {
-        await db.query('DELETE FROM campaign_hold WHERE campaign_id = ? AND customer_id = ? AND variant_id = ?', [campaignId, customerId, vId]);
-        await db.query('UPDATE campaign SET current_hold = GREATEST(0, current_hold - 1) WHERE id = ?', [campaignId]);
+      const matchedCampaign = activeCampaigns.find(c => vId && Number(c.variant_id) === vId)
+        || activeCampaigns.find(c => !c.variant_id);
+      if (matchedCampaign) {
+        const campaignId = matchedCampaign.id;
+        const [holdRow] = await db.query(
+          'SELECT id FROM campaign_hold WHERE campaign_id = ? AND customer_id = ? AND variant_id = ?',
+          [campaignId, customerId, vId]
+        );
+        if (holdRow.length) {
+          await db.query('DELETE FROM campaign_hold WHERE campaign_id = ? AND customer_id = ? AND variant_id = ?', [campaignId, customerId, vId]);
+          await db.query('UPDATE campaign SET current_hold = GREATEST(0, current_hold - 1) WHERE id = ?', [campaignId]);
+        }
       }
     }
 
