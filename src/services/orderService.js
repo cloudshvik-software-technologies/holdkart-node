@@ -1152,7 +1152,18 @@ export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, 
  * Only allowed when order_status is 'Delivered'.
  * Uses the same order_cancel_request table as cancellations.
  */
-export const returnOrder = async ({ orderId, customerId, cancellation_reason, resolution_type }) => {
+// Seller-fault reasons — matches SELLER_FAULT_REASONS in seller_node's
+// walletService.js, admin_node's financeService.js, and RETURN_REASONS in
+// customer_react's Orders.jsx.
+const SELLER_FAULT_REASONS = [
+  'Item is defective or damaged',
+  'Item does not match description',
+  'Wrong item was delivered',
+  'Item is of poor quality',
+  'Missing parts or accessories',
+];
+
+export const returnOrder = async ({ orderId, customerId, cancellation_reason, resolution_type, evidenceItems = [] }) => {
   const [rows] = await db.query('SELECT * FROM orders WHERE id = ? AND customer_id = ?', [orderId, customerId]);
   if (!rows.length) { const e = new Error('Order not found'); e.status = 404; throw e; }
   const order = rows[0];
@@ -1184,16 +1195,42 @@ export const returnOrder = async ({ orderId, customerId, cancellation_reason, re
     }
   }
 
+  // Require evidence for seller-fault reasons — matches the chargeback logic
+  // that later reads this same reason to decide whether to charge the
+  // seller for Shiprocket cost + gateway fee. No evidence, no basis for
+  // that charge, so it's enforced right here at request time.
+  if (SELLER_FAULT_REASONS.includes(cancellation_reason) && evidenceItems.length === 0) {
+    const e = new Error('At least one photo is required for this return reason'); e.status = 400; throw e;
+  }
+
+  // Above a configurable order value, a video replaces "optional photos"
+  // with a hard requirement, regardless of stated reason.
+  const [thresholdRows] = await db.query(
+    `SELECT value FROM platform_settings WHERE key = 'return_video_threshold'`
+  );
+  const videoThreshold = thresholdRows.length ? Number(thresholdRows[0].value) : 5000;
+  const orderValue = (parseFloat(order.order_amount) || 0) + (parseFloat(order.advance_amount) || 0);
+  const hasVideo = evidenceItems.some(e => e.type === 'video');
+  if (orderValue >= videoThreshold && !hasVideo) {
+    const e = new Error(`Orders above ₹${videoThreshold.toLocaleString('en-IN')} require an unboxing video, not just photos`);
+    e.status = 400;
+    throw e;
+  }
+
   await db.query(
     "UPDATE orders SET order_status = 'Return Requested', cancellation_reason = ?, resolution_type = ? WHERE id = ?",
     [cancellation_reason || null, resType, orderId]
   );
 
+  // FIX: this INSERT was missing the evidence_photo_urls column entirely —
+  // even when the frontend correctly uploaded and sent files, there was no
+  // column here to store the resulting URLs in, so they were silently
+  // dropped every time.
   await db.query(
     `INSERT INTO order_cancel_request
-       (order_id, customer_id, seller_id, cancellation_reason, resolution_type, status, created_at)
-     VALUES (?, ?, ?, ?, ?, 'Pending', NOW())`,
-    [orderId, customerId, order.seller_id, cancellation_reason || null, resType]
+       (order_id, customer_id, seller_id, cancellation_reason, resolution_type, status, created_at, evidence_photo_urls)
+     VALUES (?, ?, ?, ?, ?, 'Pending', NOW(), ?)`,
+    [orderId, customerId, order.seller_id, cancellation_reason || null, resType, JSON.stringify(evidenceItems)]
   );
 
   await db.query(
