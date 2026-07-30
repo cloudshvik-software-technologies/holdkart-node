@@ -2,6 +2,7 @@ import db from '../config/db.js';
 import * as txSvc from './transactionService.js';
 import * as shiprocket from './shiprocketService.js';
 import * as paySvc from './paymentService.js';
+import * as ledger from './ledgerService.js';
 import { sendOrderPlacedEmail, sendInvoiceEmail, sendOrderShippedEmail, sendOrderDeliveredEmail, sendRefundProcessedEmail } from '../config/email.js';
 
 const genOrderNumber = () => 'HK' + Date.now();
@@ -186,6 +187,13 @@ export const placeOrder = async ({
   if (!items || !items.length) throw new Error('No items in order');
   await ensureOrderVariantColumn();
 
+  // Platform fee is admin-configurable now (Commission Settings screen),
+  // never trusted from the client.
+  const [feeSettingRows] = await db.query(
+    `SELECT value FROM platform_settings WHERE key = 'platform_fee'`
+  );
+  platformFee = feeSettingRows.length ? Number(feeSettingRows[0].value) : 5;
+
   // SECURITY FIX (critical payment bypass): this previously marked any order
   // with paymentMethod === 'Online' as payment_status = 'Paid' immediately at
   // creation, purely on the client's say-so — no payment had to actually
@@ -249,11 +257,43 @@ export const placeOrder = async ({
     const customer = crows[0];
     subSeq += 1;
     const subOrderNumber = `${orderNumber}-${subSeq}`;
-    const [cartRow] = await db.query(
-      "SELECT price_type, locked_price, deposit_paid FROM cart WHERE customer_id = ? AND product_id = ? AND variant_id = ? AND price_type = 'DEAL' LIMIT 1",
-      [customerId, item.productId, vId]
-    );
-    const isDealItem  = cartRow.length > 0;
+    // FIX: platform fee is charged once per checkout (Cashfree only collects
+    // it once), not once per item — only the first row in a multi-item cart
+    // carries it, so SUM(platform_fee) across orders can't overcount.
+    const itemPlatformFee = subSeq === 1 ? platformFee : 0;
+
+    // BUG FIX: this used to look up the cart row by
+    // `customer_id + product_id + variant_id + price_type = 'DEAL'`, with no
+    // way to tell which cart row THIS checkout item actually came from. If a
+    // customer bought the same product both as a normal item AND as a
+    // campaign deal in one checkout (two separate cart rows, same
+    // product/variant), that query matched the DEAL row on *every* iteration
+    // — so the normal item was also priced at the deal's hold price and had
+    // the deal's whole deposit wrongly subtracted from it, while the deal
+    // item still worked correctly. Net effect: total revenue for the
+    // checkout came out short (e.g. ₹120 instead of the correct ₹165 for a
+    // ₹65 normal order + a 2-qty ₹50 deal with ₹30 deposit already paid).
+    //
+    // FIX: the frontend now sends item.cartId — the exact cart row this line
+    // was built from (see Checkout.jsx placeCOD/placeOnline). Look that row
+    // up directly by id instead of guessing by product+variant, so a normal
+    // item and a deal item for the same product can never be confused.
+    let cartRow = [];
+    if (item.cartId != null) {
+      [cartRow] = await db.query(
+        "SELECT price_type, locked_price, deposit_paid FROM cart WHERE id = ? AND customer_id = ?",
+        [item.cartId, customerId]
+      );
+    } else {
+      // Fallback for any caller that hasn't been updated to send cartId yet.
+      // Kept narrow (still requires price_type = 'DEAL') to preserve old
+      // behaviour for single-item / non-mixed checkouts.
+      [cartRow] = await db.query(
+        "SELECT price_type, locked_price, deposit_paid FROM cart WHERE customer_id = ? AND product_id = ? AND variant_id = ? AND price_type = 'DEAL' LIMIT 1",
+        [customerId, item.productId, vId]
+      );
+    }
+    const isDealItem  = cartRow.length > 0 && cartRow[0].price_type === 'DEAL';
     // BUG FIX: for a regular (non-deal) purchase of a specific variant, the
     // variant's own price_override must win over the base product's
     // retail_price. Previously this always used p.retail_price regardless of
@@ -267,12 +307,35 @@ export const placeOrder = async ({
     const depositPaid = isDealItem ? (Number(cartRow[0].deposit_paid) || 0) : 0;
     const amount      = Math.max(0, lockedPrice * item.quantity - depositPaid);
 
+    // FIX (§3.1 / §3.3): keep the real charge breakdown, not just the netted
+    // total. advanceAmount is whatever was already paid up front (deal
+    // deposit); balanceAmount is what's due on this order row itself. Every
+    // refund/receipt downstream should read these instead of re-deriving
+    // them from order_amount, which has already had the deposit netted out.
+    const advanceAmount = depositPaid;
+    const balanceAmount = amount;
+
     // Shipping for THIS product only. Multi-item checkout sends a per-item
     // rate (item.deliveryCharge); fall back to the order-level value for
     // single-item purchases (Buy Now), where it's already this item's own rate.
     const itemDeliveryCharge = item.deliveryCharge != null
       ? Number(item.deliveryCharge) || 0
       : Number(deliveryCharge) || 0;
+
+    // FIX: itemDeliveryCharge already includes the platform's delivery
+    // commission markup (applied in getAvailableCouriers). Never trust a
+    // client-supplied "actual cost" — recompute it server-side by reversing
+    // today's markup rate, the same principle used for platform_fee.
+    let deliveryCommissionPct = 5;
+    try {
+      const [settingRows] = await db.query(
+        `SELECT value FROM platform_settings WHERE key = 'delivery_commission_pct'`
+      );
+      if (settingRows.length) deliveryCommissionPct = Number(settingRows[0].value) || 0;
+    } catch {}
+    const shiprocketActualCost = Math.round(
+      (itemDeliveryCharge / (1 + deliveryCommissionPct / 100)) * 100
+    ) / 100;
 
     // Add fee columns if missing (safe to call multiple times)
     try {
@@ -300,25 +363,95 @@ export const placeOrder = async ({
         ADD COLUMN customer_courier_name VARCHAR(255) DEFAULT NULL`);
     } catch {}
 
+    // Ensure advance/balance/total columns exist (safe to call multiple times) —
+    // see migrations/001_unified_ledger.sql / 002_total_amount.sql for the
+    // canonical versions.
+    try {
+      await db.query(`ALTER TABLE orders
+        ADD COLUMN advance_amount NUMERIC(10,2) DEFAULT 0,
+        ADD COLUMN balance_amount NUMERIC(10,2) DEFAULT 0,
+        ADD COLUMN total_amount NUMERIC(10,2) DEFAULT 0`);
+    } catch {}
+
+    try {
+      await db.query(`ALTER TABLE orders ADD COLUMN shiprocket_actual_cost NUMERIC(10,2) DEFAULT 0`);
+    } catch {}
+
+    // FIX: total_amount is what the customer actually paid — product +
+    // delivery + platform fee + payment handling fee + protect promise fee.
+    // order_amount stays PRODUCT PRICE ONLY (it's the base seller commission
+    // is calculated on — see holdkart-seller-node's calcCommission). Every
+    // admin GMV/order-total/customer-LTV read should use total_amount, not
+    // order_amount, or it silently drops delivery + platform fee from every
+    // number it shows (this was the root cause of admin dashboards showing
+    // ₹65 instead of ₹155.85 for a ₹65 product + ₹80.85 delivery + ₹10
+    // platform fee order).
+    const totalAmount = Math.round((
+      advanceAmount + balanceAmount
+      + (Number(itemDeliveryCharge) || 0)
+      + (Number(itemPlatformFee) || 0)
+      + (Number(paymentHandlingFee) || 0)
+      + (Number(protectPromiseFee) || 0)
+    ) * 100) / 100;
+
     const [r] = await db.query(
       `INSERT INTO orders (order_number, sub_order_number, product_id, variant_id, seller_id, customer_id, quantity, order_amount,
         order_status, order_date, payment_status, delivery_status, address, category,
         product_name, customer_name, created_date, payment_method, customer_email, customer_phone,
         city, pincode, state, delivery_charge, platform_fee, payment_handling_fee, protect_promise_fee,
-        customer_courier_id, customer_courier_name)
-       VALUES (?,?,?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?,?,?)`,
+        customer_courier_id, customer_courier_name, advance_amount, balance_amount, total_amount, shiprocket_actual_cost)
+       VALUES (?,?,?,?,?,?,?,?,'Pending',NOW(),?,?,?,?,?,?,NOW(),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [orderNumber, subOrderNumber, p.id, vId, p.seller_id, customerId, item.quantity, amount,
        resolvedPaymentStatus,
        'Pending', address, p.category, p.product_name,
        customer?.name || '', paymentMethod,
        customer?.email || '', customer?.mobile || '', city, pincode, state,
-       Number(itemDeliveryCharge) || 0, Number(platformFee) || 0,
+       Number(itemDeliveryCharge) || 0, Number(itemPlatformFee) || 0,
        Number(paymentHandlingFee) || 0, Number(protectPromiseFee) || 0,
        // BUG FIX: store what the customer selected at checkout (Checkout.jsx /
        // BuyNow.jsx now send these on each item) so the seller can see it.
        item.courierId   != null ? Number(item.courierId) : null,
-       item.courierName || null]
+       item.courierName || null,
+       advanceAmount, balanceAmount, totalAmount, shiprocketActualCost]
     );
+
+    // FIX (§1 / §3.1): append to the unified ledger instead of leaving this
+    // charge only recorded in `orders`. This is what admin Finance reports
+    // and refund itemization now read from — a single source of truth
+    // shared across all three backends.
+    try {
+      if (advanceAmount > 0) {
+        // FIX: the deposit was already appended to the ledger at
+        // campaign-join time (see campaignService.js joinCampaign /
+        // startOrJoinCampaign / addToDeal) — that's the moment the money was
+        // actually collected. Writing a second PAYMENT entry for the same
+        // amount here would double-count it in GMV. Instead, just link the
+        // existing deposit ledger row(s) to this order now that it has one,
+        // so admin can trace deposit -> converted order.
+        await db.query(
+          `UPDATE ledger_entry SET order_id = ?, order_number = ?
+           WHERE id = (
+             SELECT id FROM ledger_entry
+             WHERE customer_id = ? AND entry_type = 'PAYMENT' AND method = 'DEAL_DEPOSIT'
+               AND order_id IS NULL AND status = 'SUCCESS' AND amount = ?
+               AND description LIKE ?
+             ORDER BY id DESC LIMIT 1
+           )`,
+          [r.insertId, subOrderNumber, customerId, advanceAmount, `%${p.product_name}%`]
+        ).catch(() => {});
+      }
+      if (balanceAmount > 0 || paymentMethod !== 'COD') {
+        await ledger.appendLedgerEntry({
+          entryType: 'PAYMENT', direction: 'CREDIT', amount: balanceAmount,
+          orderId: r.insertId, orderNumber: subOrderNumber, customerId, sellerId: p.seller_id,
+          method: paymentMethod, status: resolvedPaymentStatus === 'Paid' ? 'SUCCESS' : 'PENDING',
+          referenceTable: 'orders', referenceId: r.insertId,
+          description: `Order payment for ${p.product_name} (${subOrderNumber})`,
+        });
+      }
+    } catch (ledgerErr) {
+      console.error('[placeOrder] ledger append failed (non-fatal):', ledgerErr.message);
+    }
 
     if (vId) {
       await db.query('UPDATE product_variant SET stock_quantity = stock_quantity - ? WHERE id = ?', [item.quantity, vId]);
@@ -398,6 +531,22 @@ export const placeOrder = async ({
         ? customer.mobile
         : '9999999999';
 
+      // Compute real parcel weight/dims from the product's specs (set by the
+      // seller / admin) rather than relying on shiprocketService's 0.5kg /
+      // 10cm defaults. Multiply weight by quantity since this is the total
+      // weight for this line's shipment.
+      let productSpecs = p.specs;
+      if (typeof productSpecs === 'string') {
+        try { productSpecs = JSON.parse(productSpecs); } catch (_) { productSpecs = null; }
+      }
+      const unitWeight = parseFloat(productSpecs?.ship_weight);
+      const shipmentWeight = (!Number.isNaN(unitWeight) && unitWeight > 0)
+        ? Math.round(unitWeight * item.quantity * 1000) / 1000
+        : 0.5; // legacy fallback only — new products require ship_weight at creation
+      const shipLength = parseFloat(productSpecs?.ship_length) || 10;
+      const shipWidth   = parseFloat(productSpecs?.ship_width)  || 10;
+      const shipHeight  = parseFloat(productSpecs?.ship_height) || 10;
+
       const sr = await shiprocket.createShiprocketOrder({
         orderId:       r.insertId,
         orderNumber,
@@ -412,6 +561,10 @@ export const placeOrder = async ({
         productName:   p.product_name,
         quantity:      item.quantity,
         price:         lockedPrice,
+        weight:        shipmentWeight,
+        length:        shipLength,
+        breadth:       shipWidth,
+        height:        shipHeight,
       });
 
       // Try to auto-assign AWB + get label if shipment_id is available
@@ -454,6 +607,23 @@ export const placeOrder = async ({
           trackingUrl             || null,
         ]
       );
+
+      // FIX (§3.4): capture the courier's quoted rate at booking time so it
+      // can be reconciled against Shiprocket's actual monthly invoice later
+      // (see admin-node financeService / a future reconciliation screen).
+      // Without this, there was no record at all of what any given shipment
+      // was quoted to cost, so Shiprocket's invoice had nothing to check
+      // against — same idea as reconciling a payment gateway's settlement
+      // report against your own records.
+      try {
+        await db.query(
+          `INSERT INTO courier_cost (order_id, shiprocket_order_id, quoted_rate, invoice_month)
+           VALUES (?, ?, ?, TO_CHAR(NOW(), 'YYYY-MM'))`,
+          [r.insertId, sr.shiprocketOrderId || null, Number(itemDeliveryCharge) || 0]
+        );
+      } catch (courierCostErr) {
+        console.error('[placeOrder] courier_cost insert failed (non-fatal):', courierCostErr.message);
+      }
     } catch (srErr) {
       console.error('[orderService] Shiprocket error:', srErr.message);
       // Order is still placed — Shiprocket failure is non-fatal
@@ -621,6 +791,24 @@ export const getOrder = async (orderId, customerId) => {
   return order;
 };
 
+// FIX (§3.3): refunds must mirror the original charge breakdown exactly,
+// itemized — the same way Amazon/Flipkart refunds do — instead of just
+// refunding the netted order_amount (which silently under-refunds by the
+// delivery charge on every cancellation). Refundable = product amount +
+// advance/deposit already paid + delivery charge. platform_fee and
+// payment_handling_fee are the non-refundable service/gateway fees.
+// protect_promise_fee is a protection premium and is also non-refundable.
+const computeItemizedRefund = (order) => {
+  const advance      = Number(order.advance_amount) || 0;
+  const balance      = Number(order.balance_amount) || Number(order.order_amount) || 0;
+  const deliveryChg  = Number(order.delivery_charge) || 0;
+  const nonRefundable = (Number(order.platform_fee) || 0)
+                       + (Number(order.payment_handling_fee) || 0)
+                       + (Number(order.protect_promise_fee) || 0);
+  const refundable = Math.max(0, advance + balance + deliveryChg - nonRefundable);
+  return { advance, balance, deliveryChg, nonRefundable, refundable };
+};
+
 export const cancelOrder = async ({ orderId, customerId, cancellation_reason, resolution_type }) => {
   const [rows] = await db.query('SELECT * FROM orders WHERE id = ? AND customer_id = ?', [orderId, customerId]);
   if (!rows.length) { const e = new Error('Order not found'); e.status = 404; throw e; }
@@ -649,13 +837,14 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
       const cashfreeOrderId = txRows[0]?.cashfree_order_id;
 
       if (cashfreeOrderId) {
+        const { refundable } = computeItemizedRefund(order);
         // Initiate Cashfree refund immediately
         const refundId = `refund_${orderId}_${Date.now()}`;
         try {
           await paySvc.initiateRefund({
             cashfreeOrderId,
             refundId,
-            amount:  order.order_amount,
+            amount:  refundable,
             note:    `Order ${order.order_number} cancelled — ${cancellation_reason || 'Customer request'}`,
           });
         } catch (refundErr) {
@@ -668,13 +857,25 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
           customerId,
           orderId,
           orderNumber:     order.order_number,
-          amount:          order.order_amount,
+          amount:          refundable,
           type:            'REFUND',
           method:          'Online',
           status:          'SUCCESS',
           description:     `Refund for cancelled order ${order.order_number} — ${order.product_name}`,
           cashfreeOrderId,
         });
+
+        // FIX (§1): append the itemized refund to the unified ledger.
+        try {
+          await ledger.appendLedgerEntry({
+            entryType: 'REFUND', direction: 'DEBIT', amount: refundable,
+            orderId, orderNumber: order.order_number, customerId, sellerId: order.seller_id,
+            method: 'Online', referenceTable: 'order_cancel_request', referenceId: orderId,
+            description: `Itemized refund for cancelled order ${order.order_number} (product+advance+delivery − non-refundable fees)`,
+          });
+        } catch (ledgerErr) {
+          console.error('[cancelOrder] ledger append failed (non-fatal):', ledgerErr.message);
+        }
       }
 
       // Mark order as Cancelled + Refunded immediately
@@ -716,7 +917,7 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
             name:        order.customer_name || 'Customer',
             orderNumber: order.order_number,
             productName: order.product_name,
-            refundAmount: order.order_amount,
+            refundAmount: computeItemizedRefund(order).refundable,
           });
         }
       } catch (emailErr) {
@@ -728,7 +929,7 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
         [
           customerId,
           '✅ Order Cancelled & Refund Initiated',
-          `Your order ${order.order_number} for "${order.product_name}" has been cancelled. ₹${order.order_amount} refund has been initiated to your original payment method and will reflect within 5–7 business days.`,
+          `Your order ${order.order_number} for "${order.product_name}" has been cancelled. ₹${computeItemizedRefund(order).refundable} refund has been initiated to your original payment method and will reflect within 5–7 business days.`,
           'CANCEL_REQUEST',
         ]
       );
@@ -736,7 +937,7 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
       await notifySeller(
         order.seller_id,
         'Order Cancelled — Refund Initiated',
-        `Order ${order.order_number} for "${order.product_name}" was cancelled by the customer. ₹${order.order_amount} refund has been initiated.`
+        `Order ${order.order_number} for "${order.product_name}" was cancelled by the customer. ₹${computeItemizedRefund(order).refundable} refund has been initiated.`
       );
 
       return { message: 'Order cancelled and refund initiated successfully' };
@@ -821,6 +1022,41 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
      VALUES (?, ?, ?, ?, ?, 'Pending', NOW())`,
     [orderId, customerId, order.seller_id, cancellation_reason || null, storedResType]
   );
+
+  // FIX (§2 — wallet-bucket fix): if this order's seller credit is still in
+  // the Pending bucket (hold period not yet cleared), a return filed now must
+  // move it to Reserved, not leave it sitting in Pending where the hold-period
+  // job would release it into Available out from under an active dispute.
+  // If the hold already cleared (funds are in Available), we leave it there —
+  // reserving already-withdrawable money on a mere request (before seller/
+  // admin approval) would be too aggressive; the seller-side approval flow
+  // handles clawback from Available if the return is approved after that point.
+  if (storedResType === 'Refund') {
+    try {
+      const [pendingLedger] = await db.query(
+        `SELECT COALESCE(SUM(amount),0) AS pending_credit FROM ledger_entry
+         WHERE order_id = ? AND entry_type = 'SELLER_CREDIT' AND status = 'PENDING'`,
+        [orderId]
+      );
+      const heldAmount = Number(pendingLedger[0]?.pending_credit) || 0;
+      if (heldAmount > 0) {
+        await db.query(
+          `UPDATE seller_wallet
+           SET pending_amount  = GREATEST(0, pending_amount - ?),
+               reserved_amount = reserved_amount + ?
+           WHERE seller_id = ?`,
+          [heldAmount, heldAmount, order.seller_id]
+        );
+        await db.query(
+          `UPDATE ledger_entry SET status = 'RESERVED'
+           WHERE order_id = ? AND entry_type = 'SELLER_CREDIT' AND status = 'PENDING'`,
+          [orderId]
+        );
+      }
+    } catch (reserveErr) {
+      console.error('[cancelOrder] wallet reservation failed (non-fatal):', reserveErr.message);
+    }
+  }
 
   // Cancel on Shiprocket if we have the order ID
   try {
@@ -916,7 +1152,18 @@ export const updateOrderStatus = async ({ orderId, orderStatus, deliveryStatus, 
  * Only allowed when order_status is 'Delivered'.
  * Uses the same order_cancel_request table as cancellations.
  */
-export const returnOrder = async ({ orderId, customerId, cancellation_reason, resolution_type }) => {
+// Seller-fault reasons — matches SELLER_FAULT_REASONS in seller_node's
+// walletService.js, admin_node's financeService.js, and RETURN_REASONS in
+// customer_react's Orders.jsx.
+const SELLER_FAULT_REASONS = [
+  'Item is defective or damaged',
+  'Item does not match description',
+  'Wrong item was delivered',
+  'Item is of poor quality',
+  'Missing parts or accessories',
+];
+
+export const returnOrder = async ({ orderId, customerId, cancellation_reason, resolution_type, evidenceItems = [] }) => {
   const [rows] = await db.query('SELECT * FROM orders WHERE id = ? AND customer_id = ?', [orderId, customerId]);
   if (!rows.length) { const e = new Error('Order not found'); e.status = 404; throw e; }
   const order = rows[0];
@@ -948,16 +1195,42 @@ export const returnOrder = async ({ orderId, customerId, cancellation_reason, re
     }
   }
 
+  // Require evidence for seller-fault reasons — matches the chargeback logic
+  // that later reads this same reason to decide whether to charge the
+  // seller for Shiprocket cost + gateway fee. No evidence, no basis for
+  // that charge, so it's enforced right here at request time.
+  if (SELLER_FAULT_REASONS.includes(cancellation_reason) && evidenceItems.length === 0) {
+    const e = new Error('At least one photo is required for this return reason'); e.status = 400; throw e;
+  }
+
+  // Above a configurable order value, a video replaces "optional photos"
+  // with a hard requirement, regardless of stated reason.
+  const [thresholdRows] = await db.query(
+    `SELECT value FROM platform_settings WHERE key = 'return_video_threshold'`
+  );
+  const videoThreshold = thresholdRows.length ? Number(thresholdRows[0].value) : 5000;
+  const orderValue = (parseFloat(order.order_amount) || 0) + (parseFloat(order.advance_amount) || 0);
+  const hasVideo = evidenceItems.some(e => e.type === 'video');
+  if (orderValue >= videoThreshold && !hasVideo) {
+    const e = new Error(`Orders above ₹${videoThreshold.toLocaleString('en-IN')} require an unboxing video, not just photos`);
+    e.status = 400;
+    throw e;
+  }
+
   await db.query(
     "UPDATE orders SET order_status = 'Return Requested', cancellation_reason = ?, resolution_type = ? WHERE id = ?",
     [cancellation_reason || null, resType, orderId]
   );
 
+  // FIX: this INSERT was missing the evidence_photo_urls column entirely —
+  // even when the frontend correctly uploaded and sent files, there was no
+  // column here to store the resulting URLs in, so they were silently
+  // dropped every time.
   await db.query(
     `INSERT INTO order_cancel_request
-       (order_id, customer_id, seller_id, cancellation_reason, resolution_type, status, created_at)
-     VALUES (?, ?, ?, ?, ?, 'Pending', NOW())`,
-    [orderId, customerId, order.seller_id, cancellation_reason || null, resType]
+       (order_id, customer_id, seller_id, cancellation_reason, resolution_type, status, created_at, evidence_photo_urls)
+     VALUES (?, ?, ?, ?, ?, 'Pending', NOW(), ?)`,
+    [orderId, customerId, order.seller_id, cancellation_reason || null, resType, JSON.stringify(evidenceItems)]
   );
 
   await db.query(

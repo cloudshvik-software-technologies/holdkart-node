@@ -102,7 +102,10 @@ const PRODUCT_SELECT = `SELECT p.*,
 export const listProducts = async ({ search, category, minPrice, maxPrice, rating, page = 1, limit = 20 }) => {
   let sql = PRODUCT_SELECT;
   const params = [];
-  if (search)   { sql += ' AND p.product_name LIKE ?'; params.push(`%${search}%`); }
+  // FIX: was case-sensitive `LIKE`, so searching "indian jersey" (lowercase)
+  // returned nothing for a product actually named "Indian Jersey". Postgres's
+  // `ILIKE` matches regardless of case, same as every other e-commerce search.
+  if (search)   { sql += ' AND p.product_name ILIKE ?'; params.push(`%${search}%`); }
   if (category) { sql += ' AND p.category = ?';        params.push(category); }
   if (minPrice) { sql += ' AND p.retail_price >= ?';   params.push(minPrice); }
   if (maxPrice) { sql += ' AND p.retail_price <= ?';   params.push(maxPrice); }

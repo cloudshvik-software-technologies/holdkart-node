@@ -1,6 +1,57 @@
 import db from '../config/db.js';
 import { sendDealJoinedEmail, sendDealTargetReachedEmail } from '../config/email.js';
 import * as txSvc from './transactionService.js';
+import * as ledger from './ledgerService.js';
+import * as paySvc from './paymentService.js';
+
+// FIX: none of joinCampaign / startOrJoinCampaign / addToDeal ever verified
+// the Cashfree payment before crediting a hold, advancing the campaign
+// toward target, or auto-completing it — unlike placeOrder(), which
+// correctly re-verifies server-side. A failed or fabricated payment could
+// silently count toward (and complete) a real deal. This is the same
+// check placeOrder() already uses, applied here too.
+const verifyDeposit = async (cashfreeOrderId, totalDeposit) => {
+  if (totalDeposit <= 0) return; // nothing to verify — no money involved
+  if (!cashfreeOrderId) {
+    const e = new Error('Payment reference missing — cannot verify deposit'); e.status = 400; throw e;
+  }
+  let verified = false;
+  try {
+    verified = await paySvc.verifyPayment({ orderId: cashfreeOrderId });
+  } catch (verErr) {
+    console.error('[campaignService] deposit verification failed:', verErr.message);
+  }
+  if (!verified) {
+    const e = new Error('Payment could not be verified — deal join failed'); e.status = 402; throw e;
+  }
+};
+
+// ── notifySellerNewHold ──────────────────────────────────────────────────────
+// Fires an in-app seller_notification row whenever a customer joins/adds to a
+// campaign (hold) with an initial payment. Shared by joinCampaign,
+// startOrJoinCampaign, and addToDeal so the seller portal's notification bell
+// (and the Campaign Analytics "buyers" list) both reflect new holds in
+// real time. Never throws — a notification failure must not block the
+// customer's hold/payment flow.
+const notifySellerNewHold = async ({ sellerId, customerId, productName, quantity, amount, campaignId, variantLabel = null }) => {
+  if (!sellerId) return;
+  try {
+    const [crows] = await db.query('SELECT name, email, mobile FROM customer WHERE id = ?', [customerId]);
+    const buyerName = crows[0]?.name || `Customer #${customerId}`;
+    const amtTxt = Number(amount) > 0 ? `₹${Number(amount).toLocaleString('en-IN')}` : '₹0';
+    const variantTxt = variantLabel ? ` (${variantLabel})` : '';
+    await db.query(
+      `INSERT INTO seller_notification (seller_id, title, message, created_date, read_status)
+       VALUES (?, 'New Campaign Hold 🎉', ?, NOW(), false)`,
+      [
+        sellerId,
+        `${buyerName} just joined "${productName}"${variantTxt} — ${quantity} unit(s) held, initial payment ${amtTxt} received. (Campaign #${campaignId})`,
+      ]
+    );
+  } catch (e) {
+    console.error('[campaignService] notifySellerNewHold error:', e.message);
+  }
+};
 
 // ── One-time migration ──────────────────────────────────────────────────────
 // `campaign_hold` previously had no way to record which variant (colour /
@@ -18,11 +69,11 @@ const ensureVariantColumn = async () => {
   variantColumnReady = (async () => {
     try {
       const [cols] = await db.query(
-        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'campaign_hold' AND COLUMN_NAME = 'variant_id'`
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'campaign_hold' AND column_name = 'variant_id'`
       );
       if (!cols.length) {
-        await db.query(`ALTER TABLE campaign_hold ADD COLUMN variant_id INT NOT NULL DEFAULT 0 AFTER product_id`);
+        await db.query(`ALTER TABLE campaign_hold ADD COLUMN variant_id INT NOT NULL DEFAULT 0`);
       }
     } catch (e) {
       console.error('campaign_hold variant_id migration check failed:', e.message);
@@ -43,11 +94,11 @@ const ensureAutoRenewColumn = async () => {
   autoRenewColumnReady = (async () => {
     try {
       const [cols] = await db.query(
-        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'campaign' AND COLUMN_NAME = 'auto_renew'`
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'campaign' AND column_name = 'auto_renew'`
       );
       if (!cols.length) {
-        await db.query(`ALTER TABLE campaign ADD COLUMN auto_renew TINYINT(1) NOT NULL DEFAULT 0 AFTER target`);
+        await db.query(`ALTER TABLE campaign ADD COLUMN auto_renew SMALLINT NOT NULL DEFAULT 0`);
       }
     } catch (e) {
       console.error('campaign auto_renew migration check failed:', e.message);
@@ -91,10 +142,24 @@ export const joinCampaign = async ({ customerId, campaignId, quantity = 1, cashf
   );
   if (existing.length) { const e = new Error('You have already joined this campaign'); e.status = 409; throw e; }
 
+  // Compute the deposit BEFORE inserting hold rows so each row can carry its own
+  // share of the amount paid — this is what lets the admin panel show a proper
+  // "amount paid" per buyer instead of only an aggregate campaign price.
+  const retailPrice     = Number(c.retail_price || c.product_retail_price || 0);
+  const holdPrice       = Number(c.hold_price   || c.product_hold_price   || 0);
+  const depositPerUnit  = Math.max(0, retailPrice - holdPrice);
+  const totalDeposit    = depositAmount || (depositPerUnit * quantity);
+  const depositPerRow   = quantity > 0 ? totalDeposit / quantity : 0;
+
+  await verifyDeposit(cashfreeOrderId, totalDeposit);
+  const paymentStatus   = totalDeposit > 0 ? 'PAID' : 'NOT_REQUIRED';
+
   for (let i = 0; i < quantity; i++) {
     await db.query(
-      'INSERT INTO campaign_hold (campaign_id, customer_id, product_id) VALUES (?,?,?)',
-      [campaignId, customerId, c.product_id]
+      `INSERT INTO campaign_hold
+         (campaign_id, customer_id, product_id, deposit_amount, payment_status, cashfree_order_id)
+       VALUES (?,?,?,?,?,?)`,
+      [campaignId, customerId, c.product_id, depositPerRow, paymentStatus, cashfreeOrderId]
     );
   }
 
@@ -115,10 +180,6 @@ export const joinCampaign = async ({ customerId, campaignId, quantity = 1, cashf
   // and records the advance amount, using the actual amount paid by the
   // frontend and falling back to the calculated per-unit deposit.
   try {
-    const retailPrice    = Number(c.retail_price || c.product_retail_price || 0);
-    const holdPrice      = Number(c.hold_price   || c.product_hold_price   || 0);
-    const depositPerUnit = Math.max(0, retailPrice - holdPrice);
-    const totalDeposit   = depositAmount || (depositPerUnit * quantity);
     if (totalDeposit > 0) {
       await txSvc.record({
         customerId,
@@ -131,7 +192,31 @@ export const joinCampaign = async ({ customerId, campaignId, quantity = 1, cashf
         description:     `Deal deposit for "${c.product_name}" x${quantity} (Campaign #${campaignId})`,
         cashfreeOrderId: cashfreeOrderId,
       });
+
+      // FIX: a campaign join collects real, non-refundable money the instant
+      // it's paid (see order_cancel_request / exitCampaign — deposits are
+      // forfeited to the seller if the customer exits, never refunded to the
+      // customer). Previously this only wrote to customer_transaction, which
+      // nothing in admin GMV/profit reads — the deposit was invisible on
+      // every admin dashboard until (and unless) the hold later converted
+      // into an actual order. Appending to the ledger here makes it visible
+      // immediately, as its own line, the moment it's collected.
+      await ledger.appendLedgerEntry({
+        entryType: 'PAYMENT', direction: 'CREDIT', amount: totalDeposit,
+        customerId, sellerId: c.seller_id, campaignId,
+        method: 'DEAL_DEPOSIT', referenceTable: 'campaign_hold', referenceId: campaignId,
+        description: `Deal deposit for "${c.product_name}" x${quantity} (Campaign #${campaignId})`,
+      }).catch(e => console.error('[joinCampaign] ledger append failed (non-fatal):', e.message));
     }
+    await notifySellerNewHold({
+      sellerId:     c.seller_id,
+      customerId,
+      productName:  c.product_name,
+      quantity,
+      amount:       totalDeposit,
+      campaignId,
+      variantLabel: c.variant_label,
+    });
   } catch (txErr) {
     console.error('[campaignService] joinCampaign deposit record error:', txErr.message);
   }
@@ -358,7 +443,7 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
   await ensureVariantColumn();
 
   const [products] = await db.query(
-    'SELECT id, seller_id, hold_target FROM product WHERE id = ? AND active = true',
+    'SELECT id, seller_id, hold_target, hold_price, retail_price, product_name, category FROM product WHERE id = ? AND active = true',
     [productId]
   );
   if (!products.length) { const e = new Error('Product not found or no longer available'); e.status = 404; throw e; }
@@ -400,9 +485,14 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
       if (vRows.length) variantLabel = [vRows[0].color, vRows[0].size].filter(Boolean).join(' / ') || null;
     }
     const [result] = await db.query(
-      `INSERT INTO campaign (product_id, seller_id, target, current_hold, status, start_time, variant_id, variant_label)
-       VALUES (?, ?, ?, 0, 'ACTIVE', NOW(), ?, ?)`,
-      [productId, product.seller_id, effectiveTarget, variantId || null, variantLabel]
+      `INSERT INTO campaign
+         (product_id, seller_id, target, current_hold, status, start_time,
+          variant_id, variant_label, hold_price, retail_price, product_name, category)
+       VALUES (?, ?, ?, 0, 'ACTIVE', NOW(), ?, ?, ?, ?, ?, ?)`,
+      [
+        productId, product.seller_id, effectiveTarget, variantId || null, variantLabel,
+        product.hold_price, product.retail_price, product.product_name, product.category,
+      ]
     );
     const [newCampaign] = await db.query('SELECT * FROM campaign WHERE id = ?', [result.insertId]);
     campaign = newCampaign[0];
@@ -421,11 +511,30 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
     throw e;
   }
 
-  // Insert one row per unit so each slot is tracked individually
+  // Look up pricing BEFORE inserting hold rows so the deposit can be recorded
+  // directly on each campaign_hold row (proper per-buyer payment tracking),
+  // not just in a loosely-linked transaction record.
+  const [priceRowsPre] = await db.query(
+    'SELECT retail_price, hold_price, product_name FROM product WHERE id = ?',
+    [productId]
+  );
+  const retailPrice    = priceRowsPre.length ? Number(priceRowsPre[0].retail_price) : 0;
+  const holdPrice      = priceRowsPre.length ? Number(priceRowsPre[0].hold_price)   : 0;
+  const productNamePre = priceRowsPre.length ? priceRowsPre[0].product_name         : null;
+  const depositPerUnit = Math.max(0, retailPrice - holdPrice);
+  const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+  const depositPerRow  = quantity > 0 ? totalDeposit / quantity : 0;
+
+  await verifyDeposit(cashfreeOrderId, totalDeposit);
+  const paymentStatus  = totalDeposit > 0 ? 'PAID' : 'NOT_REQUIRED';
+
+  // Insert one row per unit
   for (let i = 0; i < quantity; i++) {
     await db.query(
-      'INSERT INTO campaign_hold (campaign_id, customer_id, product_id, variant_id) VALUES (?,?,?,?)',
-      [campaign.id, customerId, productId, variantId]
+      `INSERT INTO campaign_hold
+         (campaign_id, customer_id, product_id, variant_id, deposit_amount, payment_status, cashfree_order_id)
+       VALUES (?,?,?,?,?,?,?)`,
+      [campaign.id, customerId, productId, variantId, depositPerRow, paymentStatus, cashfreeOrderId]
     );
   }
 
@@ -441,17 +550,9 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
 
   // Record deposit transaction using actual payment info from frontend
   try {
-    const [priceRows] = await db.query(
-      'SELECT retail_price, hold_price, product_name FROM product WHERE id = ?',
-      [productId]
-    );
+    const priceRows = priceRowsPre;
     if (priceRows.length) {
-      const retailPrice    = Number(priceRows[0].retail_price);
-      const holdPrice      = Number(priceRows[0].hold_price);
-      const productName    = priceRows[0].product_name;
-      const depositPerUnit = Math.max(0, retailPrice - holdPrice);
-      // Use actual amount paid from frontend; fall back to calculated deposit
-      const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+      const productName    = productNamePre;
       if (totalDeposit > 0) {
         await txSvc.record({
           customerId,
@@ -464,30 +565,54 @@ export const startOrJoinCampaign = async ({ customerId, productId, variantId = n
           description:     `Deal deposit for "${productName}" x${quantity} (Campaign #${campaign.id})`,
           cashfreeOrderId: cashfreeOrderId,
         });
+
+        // FIX: deposits must hit the ledger the moment they're collected,
+        // not only once/if the hold converts into an order — otherwise it's
+        // invisible on admin GMV/profit until conversion (or forever, if the
+        // customer exits and it's forfeited instead — see exitCampaign).
+        await ledger.appendLedgerEntry({
+          entryType: 'PAYMENT', direction: 'CREDIT', amount: totalDeposit,
+          customerId, sellerId: product.seller_id, campaignId: campaign.id,
+          method: 'DEAL_DEPOSIT', referenceTable: 'campaign_hold', referenceId: campaign.id,
+          description: `Deal deposit for "${productName}" x${quantity} (Campaign #${campaign.id})`,
+        }).catch(e => console.error('[startOrJoinCampaign] ledger append failed (non-fatal):', e.message));
       }
+      await notifySellerNewHold({
+        sellerId:     product.seller_id,
+        customerId,
+        productName,
+        quantity,
+        amount:       totalDeposit,
+        campaignId:   campaign.id,
+        variantLabel: campaign.variant_label,
+      });
     }
   } catch (txErr) {
     console.error('[campaignService] transaction record error:', txErr.message);
   }
 
-  // Send deal joined email
-  try {
-    const [crows] = await db.query('SELECT name, email FROM customer WHERE id = ?', [customerId]);
-    if (crows.length && crows[0].email) {
-      const [prRows] = await db.query('SELECT product_name, hold_price, retail_price FROM product WHERE id = ?', [productId]);
-      await sendDealJoinedEmail(crows[0].email, {
-        name:          crows[0].name,
-        productName:   prRows[0]?.product_name || 'Product',
-        quantity,
-        depositAmount,
-        campaignId:    campaign.id,
-        holdPrice:     prRows[0]?.hold_price   || null,
-        retailPrice:   prRows[0]?.retail_price || null,
-      });
+  // FIX: same non-blocking treatment — this ran for every joiner, and for
+  // the completing joiner it stacked on top of the target-reached emails
+  // above, compounding the delay right when it mattered most.
+  (async () => {
+    try {
+      const [crows] = await db.query('SELECT name, email FROM customer WHERE id = ?', [customerId]);
+      if (crows.length && crows[0].email) {
+        const [prRows] = await db.query('SELECT product_name, hold_price, retail_price FROM product WHERE id = ?', [productId]);
+        await sendDealJoinedEmail(crows[0].email, {
+          name:          crows[0].name,
+          productName:   prRows[0]?.product_name || 'Product',
+          quantity,
+          depositAmount,
+          campaignId:    campaign.id,
+          holdPrice:     prRows[0]?.hold_price   || null,
+          retailPrice:   prRows[0]?.retail_price || null,
+        });
+      }
+    } catch (emailErr) {
+      console.error('[campaignService] join deal email error:', emailErr.message);
     }
-  } catch (emailErr) {
-    console.error('[campaignService] join deal email error:', emailErr.message);
-  }
+  })();
 
   return { message: 'You have joined the group deal!', campaignId: campaign.id };
 };
@@ -514,11 +639,29 @@ export const addToDeal = async ({ customerId, productId, variantId = null, quant
     throw e;
   }
 
+  // Look up pricing BEFORE inserting hold rows so the deposit can be recorded
+  // directly on each campaign_hold row.
+  const [priceRowsPre] = await db.query(
+    'SELECT retail_price, hold_price, product_name FROM product WHERE id = ?',
+    [productId]
+  );
+  const retailPrice    = priceRowsPre.length ? Number(priceRowsPre[0].retail_price) : 0;
+  const holdPrice      = priceRowsPre.length ? Number(priceRowsPre[0].hold_price)   : 0;
+  const productNamePre = priceRowsPre.length ? priceRowsPre[0].product_name         : null;
+  const depositPerUnit = Math.max(0, retailPrice - holdPrice);
+  const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+  const depositPerRow  = quantity > 0 ? totalDeposit / quantity : 0;
+
+  await verifyDeposit(cashfreeOrderId, totalDeposit);
+  const paymentStatus  = totalDeposit > 0 ? 'PAID' : 'NOT_REQUIRED';
+
   // Insert one row per unit
   for (let i = 0; i < quantity; i++) {
     await db.query(
-      'INSERT INTO campaign_hold (campaign_id, customer_id, product_id, variant_id) VALUES (?,?,?,?)',
-      [campaign.id, customerId, productId, variantId]
+      `INSERT INTO campaign_hold
+         (campaign_id, customer_id, product_id, variant_id, deposit_amount, payment_status, cashfree_order_id)
+       VALUES (?,?,?,?,?,?,?)`,
+      [campaign.id, customerId, productId, variantId, depositPerRow, paymentStatus, cashfreeOrderId]
     );
   }
 
@@ -535,16 +678,9 @@ export const addToDeal = async ({ customerId, productId, variantId = null, quant
 
   // Record deposit transaction for the added slots
   try {
-    const [priceRows] = await db.query(
-      'SELECT retail_price, hold_price, product_name FROM product WHERE id = ?',
-      [productId]
-    );
+    const priceRows = priceRowsPre;
     if (priceRows.length) {
-      const retailPrice    = Number(priceRows[0].retail_price);
-      const holdPrice      = Number(priceRows[0].hold_price);
-      const productName    = priceRows[0].product_name;
-      const depositPerUnit = Math.max(0, retailPrice - holdPrice);
-      const totalDeposit   = depositAmount || (depositPerUnit * quantity);
+      const productName    = productNamePre;
       if (totalDeposit > 0) {
         await txSvc.record({
           customerId,
@@ -557,7 +693,25 @@ export const addToDeal = async ({ customerId, productId, variantId = null, quant
           description:     `Deal deposit for "${productName}" x${quantity} (Campaign #${campaign.id})`,
           cashfreeOrderId: cashfreeOrderId,
         });
+
+        // FIX: same as joinCampaign/startOrJoinCampaign — write to the
+        // ledger the moment the deposit is collected.
+        await ledger.appendLedgerEntry({
+          entryType: 'PAYMENT', direction: 'CREDIT', amount: totalDeposit,
+          customerId, sellerId: campaign.seller_id, campaignId: campaign.id,
+          method: 'DEAL_DEPOSIT', referenceTable: 'campaign_hold', referenceId: campaign.id,
+          description: `Deal deposit for "${productName}" x${quantity} (Campaign #${campaign.id}) — added slots`,
+        }).catch(e => console.error('[addToDeal] ledger append failed (non-fatal):', e.message));
       }
+      await notifySellerNewHold({
+        sellerId:     campaign.seller_id,
+        customerId,
+        productName,
+        quantity,
+        amount:       totalDeposit,
+        campaignId:   campaign.id,
+        variantLabel: campaign.variant_label,
+      });
     }
   } catch (txErr) {
     console.error('[campaignService] addToDeal transaction error:', txErr.message);
@@ -697,24 +851,41 @@ async function _completeCampaignAndReset(campaign) {
       ]
     );
 
-    // Send deal target reached email
-    try {
-      const [crows] = await db.query('SELECT email FROM customer WHERE id = ?', [h.customer_id]);
-      if (crows.length && crows[0].email) {
-        const [cnameRows] = await db.query('SELECT name FROM customer WHERE id = ?', [h.customer_id]);
-        await sendDealTargetReachedEmail(crows[0].email, {
-          name:        cnameRows[0]?.name || 'Customer',
-          productName,
-          holdPrice:   lockedPrice,
-          quantity:    slotCount,
-        });
+    // FIX: this was awaited per-holder inside the completion loop — the
+    // exact code path the LAST person to join a deal runs through, since
+    // theirs is the join that triggers completion. A slow/failing SMTP
+    // connection (confirmed in logs: "Unexpected socket close") could stall
+    // their response long enough for the frontend to time out and show a
+    // failure, even though the DB work had already succeeded. Fire-and-
+    // forget, matching how notifySellerNewHold already treats email/
+    // notification failures as non-blocking.
+    (async () => {
+      try {
+        const [crows] = await db.query('SELECT email FROM customer WHERE id = ?', [h.customer_id]);
+        if (crows.length && crows[0].email) {
+          const [cnameRows] = await db.query('SELECT name FROM customer WHERE id = ?', [h.customer_id]);
+          await sendDealTargetReachedEmail(crows[0].email, {
+            name:        cnameRows[0]?.name || 'Customer',
+            productName,
+            holdPrice:   lockedPrice,
+            quantity:    slotCount,
+          });
+        }
+      } catch (emailErr) {
+        console.error('[campaignService] deal target email error:', emailErr.message);
       }
-    } catch (emailErr) {
-      console.error('[campaignService] deal target email error:', emailErr.message);
-    }
+    })();
   }
 
-  await db.query('DELETE FROM campaign_hold WHERE campaign_id = ?', [campaign.id]);
+  // FIX: this used to hard-delete every campaign_hold row the instant the
+  // campaign completed — which is exactly the data the seller's "Campaign
+  // Buyers" modal and revenue figures read from. Nothing actually needs
+  // these rows gone: the "already joined" check is scoped to this specific
+  // campaign_id, and auto-renewal always creates a brand-new campaign row
+  // for the next round, so old completed-campaign holds can never collide
+  // with a new one. Leaving them in place keeps buyer history and revenue
+  // visible after completion, same as every other financial record in this
+  // system (ledger_entry, customer_transaction) is never deleted either.
 
   const [stockRows] = await db.query(
     'SELECT stock_quantity, hold_target, seller_id FROM product WHERE id = ? AND active = true',

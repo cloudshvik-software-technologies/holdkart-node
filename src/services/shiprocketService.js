@@ -1,3 +1,5 @@
+import db from '../config/db.js';
+
 const BASE_URL = 'https://apiv2.shiprocket.in/v1/external';
 
 let _token = null;
@@ -36,6 +38,7 @@ export async function createShiprocketOrder({
   address, city, pincode, state,
   productName, quantity, price,
   weight = 0.5,
+  length = 10, breadth = 10, height = 10,
 }) {
   // Log what we received so empty fields are visible in the terminal
   console.log('[Shiprocket] createShiprocketOrder fields:', {
@@ -82,9 +85,9 @@ export async function createShiprocketOrder({
     ],
     payment_method: 'Prepaid',
     sub_total:      price * quantity,
-    length:         10,
-    breadth:        10,
-    height:         10,
+    length,
+    breadth,
+    height,
     weight,
   };
 
@@ -202,16 +205,36 @@ export async function getAvailableCouriers(originPincode, destPincode, weight = 
     data?.available_courier_companies ||
     [];
 
-  return companies.map((c) => ({
-    courierId:      c.courier_company_id,
-    courierName:    c.courier_name,
-    rate:           parseFloat(c.rate || c.freight_charge || 0),
-    etaDays:        c.estimated_delivery_days || c.etd || '—',
-    cod:            !!c.cod,
-    minWeight:      c.min_weight || 0,
-    maxWeight:      c.max_weight || 0,
-    logo:           c.courier_logo_url || null,
-    ratingScore:    c.rating || null,
-    performanceSla: c.performance_sla || null,
-  }));
+  // Delivery commission: platform adds its own margin on top of Shiprocket's
+  // real quote (e.g. Shiprocket says ₹100, customer sees ₹105). This is a
+  // platform pricing decision, unrelated to any Shiprocket negotiated rate —
+  // shiprocketRate stays the true cost owed to Shiprocket; rate is what the
+  // customer actually pays and gets stored on the order.
+  let deliveryCommissionPct = 5;
+  try {
+    const [settingRows] = await db.query(
+      `SELECT value FROM platform_settings WHERE key = 'delivery_commission_pct'`
+    );
+    if (settingRows.length) deliveryCommissionPct = Number(settingRows[0].value) || 0;
+  } catch (e) {
+    console.error('[getAvailableCouriers] delivery_commission_pct lookup failed, using default 5%:', e.message);
+  }
+
+  return companies.map((c) => {
+    const shiprocketRate = parseFloat(c.rate || c.freight_charge || 0);
+    const rate = Math.round(shiprocketRate * (1 + deliveryCommissionPct / 100) * 100) / 100;
+    return {
+      courierId:      c.courier_company_id,
+      courierName:    c.courier_name,
+      rate,
+      shiprocketRate,
+      etaDays:        c.estimated_delivery_days || c.etd || '—',
+      cod:            !!c.cod,
+      minWeight:      c.min_weight || 0,
+      maxWeight:      c.max_weight || 0,
+      logo:           c.courier_logo_url || null,
+      ratingScore:    c.rating || null,
+      performanceSla: c.performance_sla || null,
+    };
+  });
 }

@@ -65,7 +65,16 @@ export const createOrder = async ({ amount, currency = 'INR', receipt, customerI
  * Verify Cashfree payment by fetching order status from API.
  * Returns true only when payment_status === 'PAID'.
  */
-export const verifyPayment = async ({ orderId }) => {
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// FIX: this gets called twice in quick succession for the same order — once
+// from the frontend's own pre-check, once from the backend's authoritative
+// check (e.g. inside campaignService's verifyDeposit). Cashfree's sandbox
+// order status isn't always instantly consistent across two queries a few
+// hundred ms apart, so a genuinely-paid order could fail the second check
+// purely on timing. Retrying with a short delay tolerates that without
+// weakening the check itself — it still must see PAID to pass.
+export const verifyPayment = async ({ orderId }, attempt = 1) => {
   const response = await fetch(`${CF_BASE_URL}/orders/${orderId}`, {
     method:  'GET',
     headers: {
@@ -80,7 +89,18 @@ export const verifyPayment = async ({ orderId }) => {
     throw new Error(data?.message || 'Cashfree order fetch failed');
   }
 
-  return data.order_status === 'PAID';
+  if (data.order_status === 'PAID') return true;
+
+  // Only retry on a not-yet-PAID status, not on a hard failure — max 3 tries.
+  if (attempt < 3 && (data.order_status === 'ACTIVE' || data.order_status === 'PENDING')) {
+    await sleep(500 * attempt); // 500ms, then 1000ms
+    return verifyPayment({ orderId }, attempt + 1);
+  }
+
+  // DIAGNOSTIC: log the real Cashfree status on final failure so we can see
+  // exactly what Cashfree actually reported, instead of guessing blind.
+  console.error(`[verifyPayment] order ${orderId} not PAID after ${attempt} attempt(s) — Cashfree order_status: ${data.order_status}`);
+  return false;
 };
 
 /**
