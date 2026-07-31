@@ -835,22 +835,11 @@ export const getOrder = async (orderId, customerId) => {
   return order;
 };
 
-// FIX (§3.3): refunds must mirror the original charge breakdown exactly,
-// itemized — the same way Amazon/Flipkart refunds do — instead of just
-// refunding the netted order_amount (which silently under-refunds by the
-// delivery charge on every cancellation). Refundable = product amount +
-// advance/deposit already paid + delivery charge. platform_fee and
-// payment_handling_fee are the non-refundable service/gateway fees.
-// protect_promise_fee is a protection premium and is also non-refundable.
+// CORRECTED: refund is the product price only (order.order_amount) — not
+// advance/delivery/fees added on top.
 const computeItemizedRefund = (order) => {
-  const advance      = Number(order.advance_amount) || 0;
-  const balance      = Number(order.balance_amount) || Number(order.order_amount) || 0;
-  const deliveryChg  = Number(order.delivery_charge) || 0;
-  const nonRefundable = (Number(order.platform_fee) || 0)
-                       + (Number(order.payment_handling_fee) || 0)
-                       + (Number(order.protect_promise_fee) || 0);
-  const refundable = Math.max(0, advance + balance + deliveryChg - nonRefundable);
-  return { advance, balance, deliveryChg, nonRefundable, refundable };
+  const refundable = Number(order.order_amount) || 0;
+  return { refundable };
 };
 
 export const cancelOrder = async ({ orderId, customerId, cancellation_reason, resolution_type }) => {
@@ -1048,12 +1037,19 @@ export const cancelOrder = async ({ orderId, customerId, cancellation_reason, re
     }
   }
 
-  // COD orders never have money collected up front, so a Shipped-stage COD
-  // cancellation must never be recorded as a "Refund" request — there is
-  // nothing to refund. Store it as a plain "Cancellation" resolution so it
-  // does not show up in the seller's Refund Manager (which only lists
-  // resolution_type = 'Refund' requests).
-  const storedResType = (resType === 'Refund' && !isOnline) ? 'Cancellation' : resType;
+  // BUG FIX: this used to store resolution_type = 'Cancellation' for
+  // Shipped-stage COD cancellations, to keep them out of the seller's
+  // Refund Manager (which only lists resolution_type = 'Refund' requests).
+  // But both orders.resolution_type and order_cancel_request.resolution_type
+  // have a CHECK constraint that only allows 'Refund' or 'Replace' —
+  // 'Cancellation' is not a legal value, so this UPDATE/INSERT pair failed
+  // outright (constraint violation) for every COD order cancelled after
+  // shipping. Store the real resType ('Refund') instead; the seller's
+  // listForSeller() query already has its own, independent
+  // `payment_method = 'ONLINE'` filter that excludes COD requests from the
+  // Refund Manager, so this extra resolution_type disguise was redundant
+  // even before it turned out to be illegal.
+  const storedResType = resType;
 
   await db.query(
     "UPDATE orders SET order_status = 'Cancellation Requested', cancellation_reason = ?, resolution_type = ? WHERE id = ?",

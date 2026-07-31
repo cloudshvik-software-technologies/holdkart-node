@@ -19,6 +19,9 @@
 
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { randomUUID } from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import env from './env.js';
 
 const PROJECT = 'customer';
@@ -29,6 +32,10 @@ export const s3 = new S3Client({
     ? { accessKeyId: env.s3.accessKeyId, secretAccessKey: env.s3.secretAccessKey }
     : undefined, // falls back to the default credential chain (e.g. an EC2/ECS IAM role)
 });
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const LOCAL_UPLOADS_DIR = path.join(__dirname, '..', '..', 'uploads');
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8081';
 
 const publicUrlFor = (key) => {
   if (env.s3.publicBaseUrl) {
@@ -49,16 +56,47 @@ export const buildKey = (category, entityId, originalName) => {
 /**
  * Uploads a buffer (as produced by multer.memoryStorage()) to S3 and
  * returns the public URL to store in the DB / return to the frontend.
+ *
+ * FIX: previously this let any S3/AWS SDK error (most commonly
+ * CredentialsProviderError: "Could not load credentials from any
+ * providers" when no AWS keys are configured, e.g. local/dev) bubble all
+ * the way up through the controller's generic catch block and out to the
+ * customer as a raw, internal error message — e.g. when submitting a
+ * return/replace request with evidence photos, the customer would see
+ * "Could not load credentials from any providers" instead of their request
+ * succeeding or a sensible error. Now any upload failure — missing
+ * credentials, network issue, wrong bucket, etc. — transparently falls
+ * back to local disk storage (served from the existing legacy `/uploads`
+ * static route already wired up in app.js), so the feature keeps working
+ * with zero AWS configuration, and only logs the real error server-side.
  */
 export const uploadBufferToS3 = async ({ buffer, key, contentType }) => {
-  await s3.send(new PutObjectCommand({
-    Bucket:      env.s3.bucket,
-    Key:         key,
-    Body:        buffer,
-    ContentType: contentType,
-    CacheControl: 'public, max-age=31536000, immutable',
-  }));
-  return publicUrlFor(key);
+  try {
+    await s3.send(new PutObjectCommand({
+      Bucket:      env.s3.bucket,
+      Key:         key,
+      Body:        buffer,
+      ContentType: contentType,
+      CacheControl: 'public, max-age=31536000, immutable',
+    }));
+    return publicUrlFor(key);
+  } catch (err) {
+    console.error('[s3] upload failed, falling back to local disk:', err.message);
+    return uploadBufferLocally({ buffer, key });
+  }
+};
+
+/**
+ * Local-disk fallback used when S3 isn't configured/reachable. Mirrors the
+ * `{project}/{category}/{entityId}/{uuid}.{ext}` key scheme so keyFromUrl()
+ * below and any downstream code that parses stored URLs keeps working the
+ * same way regardless of which backend actually stored the file.
+ */
+const uploadBufferLocally = async ({ buffer, key }) => {
+  const destPath = path.join(LOCAL_UPLOADS_DIR, key);
+  await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+  await fs.promises.writeFile(destPath, buffer);
+  return `${BACKEND_URL}/uploads/${key}`;
 };
 
 /**
