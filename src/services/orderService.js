@@ -783,6 +783,9 @@ export const listOrders = async (customerId) => {
         WHERE rv.customer_id = o.customer_id
           AND rv.product_id = o.product_id) AS has_reviewed,
        p.image_url AS product_image_raw,
+       p.is_replacement_eligible,
+       p.is_returnable,
+       p.return_window_days,
        pv.color AS variant_color, pv.size AS variant_size,
        (SELECT vi.image_url FROM product_variant_image vi
         WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS variant_image_raw,
@@ -809,6 +812,9 @@ export const getOrder = async (orderId, customerId) => {
   const [rows] = await db.query(
     `SELECT o.*, s.business_name AS "sellerName", s.email AS "sellerEmail",
        p.image_url AS product_image_raw,
+       p.is_replacement_eligible,
+       p.is_returnable,
+       p.return_window_days,
        pv.color AS variant_color, pv.size AS variant_size,
        (SELECT vi.image_url FROM product_variant_image vi
         WHERE vi.variant_id = pv.id ORDER BY vi.sort_order, vi.id LIMIT 1) AS variant_image_raw,
@@ -1212,6 +1218,34 @@ export const returnOrder = async ({ orderId, customerId, cancellation_reason, re
     const e = new Error('Return requests are only allowed for delivered orders'); e.status = 400; throw e;
   }
 
+  // FEATURE: "Ask about return" — the parent gate for the whole
+  // return/refund/replace flow. If the product isn't returnable at all,
+  // nothing past this point is allowed, regardless of resolution_type.
+  // If it is returnable, the window (in days, counted from the delivered
+  // email timestamp — the same signal already used elsewhere in this file
+  // to mark an order Delivered exactly once) must not have expired.
+  const [productPolicyRows] = await db.query(
+    'SELECT is_returnable, return_window_days, is_replacement_eligible FROM product WHERE id = ?',
+    [order.product_id]
+  );
+  const productPolicy = productPolicyRows[0] || {};
+  const isReturnable = productPolicy.is_returnable === true;
+  if (!isReturnable) {
+    const e = new Error('This product is not eligible for return, refund, or replacement.');
+    e.status = 400;
+    throw e;
+  }
+  const returnWindowDays = Number(productPolicy.return_window_days) || 0;
+  const deliveredAt = order.delivered_email_sent_at;
+  if (returnWindowDays > 0 && deliveredAt) {
+    const deadline = new Date(new Date(deliveredAt).getTime() + returnWindowDays * 24 * 60 * 60 * 1000);
+    if (new Date() > deadline) {
+      const e = new Error(`The ${returnWindowDays}-day return window for this product has expired.`);
+      e.status = 400;
+      throw e;
+    }
+  }
+
   const isOnline = (order.payment_method || '').toUpperCase() === 'ONLINE';
   let resType = ['Refund', 'Replace'].includes(resolution_type) ? resolution_type : 'Refund';
 
@@ -1230,6 +1264,24 @@ export const returnOrder = async ({ orderId, customerId, cancellation_reason, re
     );
     if (existing.length) {
       const e = new Error('A replacement has already been used for this order. Only one replacement is allowed.');
+      e.status = 400;
+      throw e;
+    }
+
+    // FEATURE: "Ask about replacement" — only products the seller (or
+    // admin) has explicitly marked eligible can be replaced. Enforced here
+    // (not just hidden in the UI) so a Replace request can never sneak
+    // through for an ineligible product via a direct API call. For a COD
+    // order this can leave literally no valid resolution (COD has no
+    // refund path either) — the frontend is expected to detect that case
+    // up front and not offer a return/replace flow at all for that order.
+    const isEligible = productPolicy.is_replacement_eligible !== false;
+    if (!isEligible) {
+      const e = new Error(
+        isOnline
+          ? 'This product is not eligible for replacement. Please choose a refund instead.'
+          : 'This product is not eligible for replacement, and this order has no refund path (COD).'
+      );
       e.status = 400;
       throw e;
     }

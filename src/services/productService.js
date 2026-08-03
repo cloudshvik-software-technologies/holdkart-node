@@ -54,6 +54,22 @@ const toProduct = (p) => {
     otherVariantDealsCount,
     stock, remainingStock, active: Boolean(p.active),
     hasVariants: Boolean(p.has_variants),
+    // FEATURE: "Ask about replacement" — whether this specific product can
+    // be replaced post-delivery. Gates the "Request a Replacement" option
+    // in Orders.jsx and is showcased on the listing/detail pages so
+    // customers know before they buy. Defaults to true for legacy rows
+    // that predate this column (shouldn't happen after the migration, but
+    // keeps old cached responses/tests from breaking).
+    isReplacementEligible: p.is_replacement_eligible === undefined
+      ? true
+      : Boolean(p.is_replacement_eligible),
+    // FEATURE: "Ask about return" — parent flag + window (days) for the
+    // whole post-delivery return/refund/replace flow. Defaults to false/0
+    // for legacy rows without the column, matching the DB default.
+    isReturnable: Boolean(p.is_returnable),
+    returnWindowDays: p.return_window_days === undefined || p.return_window_days === null
+      ? 0
+      : Number(p.return_window_days),
     warehouseLocation: p.warehouse_location,
     avgRating: Number(p.avg_rating) || 0, reviewCount: Number(p.review_count) || 0,
     specs: parseSpecs(p.specs),
