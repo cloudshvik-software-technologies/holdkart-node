@@ -4,6 +4,7 @@ import * as shiprocket from './shiprocketService.js';
 import * as paySvc from './paymentService.js';
 import * as ledger from './ledgerService.js';
 import { sendOrderPlacedEmail, sendInvoiceEmail, sendOrderShippedEmail, sendOrderDeliveredEmail, sendRefundProcessedEmail } from '../config/email.js';
+import { isValidUpiId } from '../helpers/upiValidation.js';
 
 const genOrderNumber = () => 'HK' + Date.now();
 
@@ -1209,7 +1210,7 @@ const SELLER_FAULT_REASONS = [
   'Missing parts or accessories',
 ];
 
-export const returnOrder = async ({ orderId, customerId, cancellation_reason, resolution_type, evidenceItems = [] }) => {
+export const returnOrder = async ({ orderId, customerId, cancellation_reason, resolution_type, evidenceItems = [], refundPayoutMethod, refundPayoutDetails }) => {
   const [rows] = await db.query('SELECT * FROM orders WHERE id = ? AND customer_id = ?', [orderId, customerId]);
   if (!rows.length) { const e = new Error('Order not found'); e.status = 404; throw e; }
   const order = rows[0];
@@ -1249,12 +1250,48 @@ export const returnOrder = async ({ orderId, customerId, cancellation_reason, re
   const isOnline = (order.payment_method || '').toUpperCase() === 'ONLINE';
   let resType = ['Refund', 'Replace'].includes(resolution_type) ? resolution_type : 'Refund';
 
-  // COD orders never had money collected up front, so a "Refund" resolution
-  // is not valid for them — fall back to "Replace" (or block entirely if a
-  // replacement was already used) so no refund request is ever created for
-  // a COD order.
+  // FEATURE: COD refund — COD never had money collected up front, so there
+  // is no "original payment method" to send it back to. Rather than force
+  // every COD return into Replace, we now allow Refund on COD too, as long
+  // as the customer tells us WHERE to send the money (UPI or bank account) —
+  // admin then pays it out manually (see admin_node financeService, which
+  // skips the Cashfree online-refund call for COD and surfaces these details
+  // instead). Online orders keep refunding to the original payment method as
+  // before (refund_payout_method stays 'ORIGINAL', no details needed).
+  let payoutMethod = 'ORIGINAL';
+  let payoutDetails = null;
   if (resType === 'Refund' && !isOnline) {
-    resType = 'Replace';
+    payoutMethod = ['UPI', 'BANK'].includes(refundPayoutMethod) ? refundPayoutMethod : null;
+    if (!payoutMethod) {
+      const e = new Error('Please provide a UPI ID or bank account to receive your COD refund.');
+      e.status = 400;
+      throw e;
+    }
+    // multipart/form-data (when evidence photos are attached) arrives as a
+    // JSON string field rather than a parsed object — normalize either way.
+    let details = refundPayoutDetails;
+    if (typeof details === 'string') {
+      try { details = JSON.parse(details); } catch { details = {}; }
+    }
+    if (payoutMethod === 'UPI') {
+      const upiId = (details?.upiId || '').trim();
+      if (!upiId || !isValidUpiId(upiId)) {
+        const e = new Error('Please provide a valid UPI ID (e.g. name@okhdfcbank, name@ybl, name@paytm).');
+        e.status = 400;
+        throw e;
+      }
+      payoutDetails = { upiId };
+    } else {
+      const accountNumber = (details?.accountNumber || '').trim();
+      const ifsc          = (details?.ifsc || '').trim().toUpperCase();
+      const accountHolder = (details?.accountHolder || '').trim();
+      if (!accountNumber || accountNumber.length < 6 || !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc) || !accountHolder) {
+        const e = new Error('Please provide a valid account number, IFSC code, and account holder name.');
+        e.status = 400;
+        throw e;
+      }
+      payoutDetails = { accountNumber, ifsc, accountHolder };
+    }
   }
 
   if (resType === 'Replace') {
@@ -1271,17 +1308,10 @@ export const returnOrder = async ({ orderId, customerId, cancellation_reason, re
     // FEATURE: "Ask about replacement" — only products the seller (or
     // admin) has explicitly marked eligible can be replaced. Enforced here
     // (not just hidden in the UI) so a Replace request can never sneak
-    // through for an ineligible product via a direct API call. For a COD
-    // order this can leave literally no valid resolution (COD has no
-    // refund path either) — the frontend is expected to detect that case
-    // up front and not offer a return/replace flow at all for that order.
+    // through for an ineligible product via a direct API call.
     const isEligible = productPolicy.is_replacement_eligible !== false;
     if (!isEligible) {
-      const e = new Error(
-        isOnline
-          ? 'This product is not eligible for replacement. Please choose a refund instead.'
-          : 'This product is not eligible for replacement, and this order has no refund path (COD).'
-      );
+      const e = new Error('This product is not eligible for replacement. Please choose a refund instead.');
       e.status = 400;
       throw e;
     }
@@ -1320,9 +1350,9 @@ export const returnOrder = async ({ orderId, customerId, cancellation_reason, re
   // dropped every time.
   await db.query(
     `INSERT INTO order_cancel_request
-       (order_id, customer_id, seller_id, cancellation_reason, resolution_type, status, created_at, evidence_photo_urls)
-     VALUES (?, ?, ?, ?, ?, 'Pending', NOW(), ?)`,
-    [orderId, customerId, order.seller_id, cancellation_reason || null, resType, JSON.stringify(evidenceItems)]
+       (order_id, customer_id, seller_id, cancellation_reason, resolution_type, status, created_at, evidence_photo_urls, refund_payout_method, refund_payout_details)
+     VALUES (?, ?, ?, ?, ?, 'Pending', NOW(), ?, ?, ?)`,
+    [orderId, customerId, order.seller_id, cancellation_reason || null, resType, JSON.stringify(evidenceItems), payoutMethod, payoutDetails ? JSON.stringify(payoutDetails) : null]
   );
 
   await db.query(

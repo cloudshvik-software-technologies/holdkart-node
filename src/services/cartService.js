@@ -129,6 +129,9 @@ export const getCart = async (customerId) => {
        p.category,
        p.hold_target    AS "holdTarget",
        p.specs,
+       p.is_returnable,
+       p.return_window_days,
+       p.is_replacement_eligible,
        pv.color           AS "variantColor",
        pv.size            AS "variantSize",
        pv.price_override  AS "variantPrice",
@@ -211,6 +214,14 @@ export const getCart = async (customerId) => {
       subtotal:      effectivePrice * r.quantity,
       shipCod,
       shipOnline,
+      // FEATURE: "Ask about return" — carried through to checkout so the
+      // Order Summary / trust badges can show this product's actual
+      // return policy instead of a hardcoded "7-Day Easy Returns" claim.
+      isReturnable:      Boolean(r.is_returnable),
+      returnWindowDays:  r.return_window_days == null ? 0 : Number(r.return_window_days),
+      isReplacementEligible: r.is_replacement_eligible === undefined
+        ? true
+        : Boolean(r.is_replacement_eligible),
       // Per-unit weight in kg (null if the seller hasn't set one yet).
       // Multiply by quantity on the frontend to get total_weight, same as
       // the existing `item.quantity * item.weight` calculation.
